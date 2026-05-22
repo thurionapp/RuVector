@@ -677,7 +677,7 @@ export function poincareToLorentz(x: Float32Array, c: number = 1): Float32Array 
   const result = new Float32Array(x.length + 1);
   result[0] = (1 + c * normSq) / denom; // Time component
   for (let i = 0; i < x.length; i++) {
-    result[i + 1] = 2 * Math.sqrt(c) * x[i] / denom;
+    result[i + 1] = 2 * Math.sqrt(c) * x[i]! / denom;
   }
   return result;
 }
