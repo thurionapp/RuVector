@@ -304,7 +304,7 @@ export class OpenRouterProvider implements LLMProvider {
    */
   async *stream(messages: Message[], options?: StreamOptions): AsyncGenerator<Token, Completion, void> {
     const modelInfo = this.getModel();
-    const response = await this.makeStreamRequest('/v1/chat/completions', {
+    const response = this.makeStreamRequest('/v1/chat/completions', {
       model: this.model,
       max_tokens: options?.maxTokens ?? modelInfo.maxTokens,
       temperature: options?.temperature ?? 1.0,
@@ -363,7 +363,7 @@ export class OpenRouterProvider implements LLMProvider {
     for (const pending of pendingToolCalls.values()) {
       if (pending.id && pending.name) {
         try {
-          const input = JSON.parse(pending.arguments || '{}');
+          const input = JSON.parse(pending.arguments || '{}') as Record<string, unknown>;
           toolCalls.push({ id: pending.id, name: pending.name, input });
           yield { type: 'tool_use', toolUse: { id: pending.id, name: pending.name, input } };
         } catch {
@@ -383,9 +383,9 @@ export class OpenRouterProvider implements LLMProvider {
   /**
    * Count tokens in text
    */
-  async countTokens(text: string): Promise<number> {
+  countTokens(text: string): Promise<number> {
     // Approximate token count (~4 chars per token)
-    return Math.ceil(text.length / 4);
+    return Promise.resolve(Math.ceil(text.length / 4));
   }
 
   /**
@@ -464,7 +464,7 @@ export class OpenRouterProvider implements LLMProvider {
     const toolCalls: ToolCall[] = (choice.message.tool_calls ?? []).map(tc => ({
       id: tc.id,
       name: tc.function.name,
-      input: JSON.parse(tc.function.arguments || '{}'),
+      input: JSON.parse(tc.function.arguments || '{}') as Record<string, unknown>,
     }));
 
     let finishReason: Completion['finishReason'] = 'stop';
@@ -554,7 +554,7 @@ export class OpenRouterProvider implements LLMProvider {
         const { done, value } = await reader.read();
         if (done) break;
 
-        buffer += decoder.decode(value, { stream: true });
+        buffer += decoder.decode(value as Uint8Array | undefined, { stream: true });
         const lines = buffer.split('\n');
         buffer = lines.pop() ?? '';
 
