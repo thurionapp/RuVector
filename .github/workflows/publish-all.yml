@@ -125,7 +125,7 @@ jobs:
       - name: Copy to platform package
         shell: bash
         run: |
-          NODE_FILE=$(find crates/ruvector-attention-node -name "*.node" -type f | head -1)
+          NODE_FILE=$(find crates/ruvector-attention-node -name "*.node" -type f ! -path "*/npm/*" | head -1)
           mkdir -p "crates/ruvector-attention-node/npm/${{ matrix.settings.platform }}"
           cp -v "$NODE_FILE" "crates/ruvector-attention-node/npm/${{ matrix.settings.platform }}/${{ matrix.settings.node_file }}"
 
