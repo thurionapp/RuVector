@@ -459,13 +459,13 @@ describe('CoordinationProtocol', () => {
     // Set up message forwarding
     protocol1.on('message:transmit', (message: { to?: string; [key: string]: unknown }) => {
       if (message.to === 'node-2' || !message.to) {
-        void protocol2.receiveMessage(message as import('./coordination-protocol').Message);
+        void protocol2.receiveMessage(message as unknown as import('./coordination-protocol').Message);
       }
     });
 
     protocol2.on('message:transmit', (message: { to?: string; [key: string]: unknown }) => {
       if (message.to === 'node-1' || !message.to) {
-        void protocol1.receiveMessage(message as import('./coordination-protocol').Message);
+        void protocol1.receiveMessage(message as unknown as import('./coordination-protocol').Message);
       }
     });
   });
@@ -505,7 +505,7 @@ describe('CoordinationProtocol', () => {
       { expectResponse: true }
     );
 
-    expect(response.status).toBe('ok');
+    expect(response!.status).toBe('ok');
   });
 
   test('should broadcast messages to all nodes', async () => {
@@ -784,7 +784,7 @@ describe('Failover Scenarios', () => {
 
     protocol1.on('message:transmit', (message: { to?: string; [key: string]: unknown }) => {
       if (!networkPartitioned && message.to === 'node-2') {
-        void protocol2.receiveMessage(message as import('./coordination-protocol').Message);
+        void protocol2.receiveMessage(message as unknown as import('./coordination-protocol').Message);
       }
     });
 

@@ -18,8 +18,8 @@
   },
   "scripts": {
     "artifacts": "napi artifacts",
-    "build": "napi build --platform --release -p ruvector-sona --manifest-path ../../../crates/sona/Cargo.toml -F napi",
-    "build:debug": "napi build --platform -p ruvector-sona --manifest-path ../../../crates/sona/Cargo.toml -F napi",
+    "build": "napi build --platform --release -p ruvector-sona --cargo-cwd ../../../crates/sona --features napi",
+    "build:debug": "napi build --platform -p ruvector-sona --cargo-cwd ../../../crates/sona --features napi",
     "test": "node --test",
     "universal": "napi universal",
     "version": "napi version"
