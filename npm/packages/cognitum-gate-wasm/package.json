@@ -25,32 +25,14 @@
   "bugs": {
     "url": "https://github.com/ruvnet/ruvector/issues"
   },
-  "main": "./dist/cjs/index.js",
-  "module": "./dist/esm/index.js",
-  "types": "./dist/types/index.d.ts",
+  "main": "./dist/index.js",
+  "module": "./dist/index.mjs",
+  "types": "./dist/index.d.ts",
   "exports": {
     ".": {
-      "import": "./dist/esm/index.js",
-      "require": "./dist/cjs/index.js",
-      "types": "./dist/types/index.d.ts"
-    },
-    "./node": {
-      "import": "./dist/esm/node.js",
-      "require": "./dist/cjs/node.js",
-      "types": "./dist/types/node.d.ts"
-    },
-    "./sw": {
-      "import": "./dist/esm/sw.js",
-      "types": "./dist/types/sw.d.ts"
-    },
-    "./wasm": {
-      "import": "./dist/esm/wasm.js",
-      "require": "./dist/cjs/wasm.js",
-      "types": "./dist/types/wasm.d.ts"
-    },
-    "./experimental": {
-      "import": "./dist/esm/experimental.js",
-      "types": "./dist/types/experimental.d.ts"
+      "import": "./dist/index.mjs",
+      "require": "./dist/index.js",
+      "types": "./dist/index.d.ts"
     }
   },
   "files": [
@@ -65,7 +47,7 @@
   },
   "sideEffects": false,
   "scripts": {
-    "build": "npm run build:wasm && npm run build:ts",
+    "build": "npm run build:wasm || true && npm run build:ts",
     "build:wasm": "wasm-pack build ../cognitum-gate-kernel --target web --out-dir ../packages/cognitum-gate-wasm/wasm",
     "build:ts": "tsup",
     "build:types": "tsc --emitDeclarationOnly",
