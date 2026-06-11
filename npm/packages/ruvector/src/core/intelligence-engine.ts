@@ -171,6 +171,9 @@ export class IntelligenceEngine {
 
   // Runtime state
   private currentTrajectoryId: number | null = null;
+  private currentTrajectoryContext: string | null = null;
+  private currentTrajectoryFile: string | undefined = undefined;
+  private currentTrajectoryAgent: string | null = null;
   private sessionStart: number = Date.now();
   private learningEnabled: boolean = true;
   private episodeBatchQueue: BatchEpisode[] = [];
@@ -638,6 +641,12 @@ export class IntelligenceEngine {
   beginTrajectory(context: string, file?: string): void {
     const embed = this.embed(context + ' ' + (file || ''));
 
+    // Remember the task context so endTrajectory() can write the routing
+    // outcome into the same state namespace route() reads (issue #517).
+    this.currentTrajectoryContext = context;
+    this.currentTrajectoryFile = file;
+    this.currentTrajectoryAgent = null;
+
     if (this.sona) {
       try {
         this.currentTrajectoryId = this.sona.beginTrajectory(embed);
@@ -678,13 +687,28 @@ export class IntelligenceEngine {
       }
     }
 
+    // Close the routing learning loop: if a route was chosen for this
+    // trajectory, record its outcome under the state key route() queries.
+    if (this.currentTrajectoryAgent && this.currentTrajectoryContext) {
+      this.recordRouteOutcome(
+        this.currentTrajectoryContext,
+        this.currentTrajectoryFile,
+        this.currentTrajectoryAgent,
+        q
+      );
+    }
+
     this.currentTrajectoryId = null;
+    this.currentTrajectoryContext = null;
+    this.currentTrajectoryFile = undefined;
+    this.currentTrajectoryAgent = null;
   }
 
   /**
    * Set the agent route for current trajectory
    */
   setTrajectoryRoute(agent: string): void {
+    this.currentTrajectoryAgent = agent;
     if (this.sona && this.currentTrajectoryId !== null) {
       try {
         this.sona.setRoute(this.currentTrajectoryId, agent);
@@ -692,6 +716,27 @@ export class IntelligenceEngine {
         // Ignore route errors
       }
     }
+  }
+
+  /**
+   * Record the outcome of an agent routing decision.
+   *
+   * This is the write-side counterpart of route(): it derives the state key
+   * with the exact same getState()/getExtension() logic route() uses for
+   * lookups, so learned agent outcomes actually influence future routing
+   * (fixes #517 — previously only command/edit outcome episodes were stored,
+   * under state keys route() never queries).
+   */
+  recordRouteOutcome(task: string, file: string | undefined, agent: string, reward: number): void {
+    if (!agent || agent === 'unknown') return;
+    const ext = file ? this.getExtension(file) : '';
+    const state = this.getState(task, ext);
+    if (!this.routingPatterns.has(state)) {
+      this.routingPatterns.set(state, new Map());
+    }
+    const patterns = this.routingPatterns.get(state)!;
+    const oldValue = patterns.get(agent) ?? 0.5;
+    patterns.set(agent, oldValue + this.config.learningRate * (reward - oldValue));
   }
 
   // =========================================================================

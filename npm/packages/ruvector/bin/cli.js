@@ -2937,7 +2937,12 @@ class Intelligence {
           agents: data.agents || defaults.agents,
           edges: data.edges || defaults.edges,
           stats: { ...defaults.stats, ...(data.stats || {}) },
-          // Preserve learning data if present
+          // Preserve in-flight trajectories so trajectory-end (run in a later
+          // process) can find what trajectory-begin recorded (#517)
+          activeTrajectories: data.activeTrajectories || {},
+          // Preserve auxiliary learned data if present
+          coEditPatterns: data.coEditPatterns || undefined,
+          sequences: data.sequences || undefined,
           learning: data.learning || undefined
         };
       }
@@ -3093,6 +3098,48 @@ class Intelligence {
     }
   }
 
+  // Canonical routing state key — MUST mirror IntelligenceEngine.getState()/
+  // getExtension() so patterns written here are found by engine.route() (#517).
+  routeState(task, file) {
+    const t = task || '';
+    const taskType = t.includes('fix') ? 'fix' :
+                     t.includes('test') ? 'test' :
+                     t.includes('refactor') ? 'refactor' :
+                     t.includes('document') ? 'docs' : 'edit';
+    let ext = '';
+    if (file) {
+      const idx = file.lastIndexOf('.');
+      ext = idx >= 0 ? file.slice(idx).toLowerCase() : '';
+    }
+    return `${taskType}:${ext || 'unknown'}`;
+  }
+
+  // Record an agent routing outcome under the state key route() reads.
+  // Uses the engine's Q-update semantics (0.5 baseline), so a single good
+  // outcome (reward > 0.5) is enough to beat the static default mapping.
+  recordRouteOutcome(task, file, agent, reward) {
+    if (!agent || agent === 'unknown') return null;
+    const state = this.routeState(task, file);
+    const key = `${state}|${agent}`;
+    if (!this.data.patterns) this.data.patterns = {};
+    if (!this.data.stats) this.data.stats = { total_patterns: 0, total_memories: 0, total_trajectories: 0, total_errors: 0, session_count: 0, last_session: 0 };
+    if (!this.data.patterns[key]) {
+      this.data.patterns[key] = { state, action: agent, q_value: 0.5, visits: 0, last_update: 0 };
+    }
+    const p = this.data.patterns[key];
+    p.q_value = p.q_value + this.alpha * (reward - p.q_value);
+    p.visits++;
+    p.last_update = this.now();
+    this.data.stats.total_patterns = Object.keys(this.data.patterns).length;
+
+    // Forward to engine if already initialized (don't trigger lazy load)
+    const eng = this.getEngineIfReady();
+    if (eng && typeof eng.recordRouteOutcome === 'function') {
+      try { eng.recordRouteOutcome(task, file, agent, reward); } catch {}
+    }
+    return key;
+  }
+
   learn(state, action, outcome, reward) {
     const id = `traj_${this.now()}`;
     this.updateQ(state, action, reward);
@@ -3145,7 +3192,10 @@ class Intelligence {
 
   route(task, file, crateName, operation = 'edit') {
     const fileType = file ? path.extname(file).slice(1) : 'unknown';
-    const state = `${operation}_${fileType}_in_${crateName ?? 'project'}`;
+    // Canonical state shared with the write side (recordRouteOutcome) and
+    // the engine's route() — previously this read `edit_ts_in_project`-style
+    // keys that no learning path ever wrote agent actions for (#517).
+    const state = this.routeState(task || operation, file);
     const agentMap = {
       rs: ['rust-developer', 'coder', 'reviewer', 'tester'],
       ts: ['typescript-developer', 'coder', 'frontend-dev'],
@@ -3159,7 +3209,16 @@ class Intelligence {
       yml: ['devops-engineer', 'coder'],
       yaml: ['devops-engineer', 'coder']
     };
-    const agents = agentMap[fileType] ?? ['coder', 'reviewer'];
+    const agents = (agentMap[fileType] ?? ['coder', 'reviewer']).slice();
+    // Include agents learned for this state (e.g. from trajectory outcomes)
+    // even if they are not in the static candidate list.
+    const prefix = `${state}|`;
+    for (const key of Object.keys(this.data.patterns || {})) {
+      if (key.startsWith(prefix)) {
+        const learned = key.slice(prefix.length);
+        if (learned && !agents.includes(learned)) agents.push(learned);
+      }
+    }
     const { action, confidence } = this.suggest(state, agents);
     const reason = confidence > 0.5 ? 'learned from past success' : confidence > 0 ? 'based on patterns' : `default for ${fileType} files`;
 
@@ -4274,6 +4333,7 @@ hooksCmd.command('trajectory-begin')
   .description('Begin tracking a new execution trajectory')
   .requiredOption('-c, --context <context>', 'Task or operation context')
   .option('-a, --agent <agent>', 'Agent performing the task', 'unknown')
+  .option('-f, --file <file>', 'Primary file being worked on')
   .action((opts) => {
     const intel = new Intelligence({ skipEngine: true });  // Fast mode - no engine needed
     const trajId = `traj_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
@@ -4282,6 +4342,7 @@ hooksCmd.command('trajectory-begin')
       id: trajId,
       context: opts.context,
       agent: opts.agent,
+      file: opts.file || null,
       steps: [],
       startTime: Date.now()
     };
@@ -4335,6 +4396,14 @@ hooksCmd.command('trajectory-end')
     if (!intel.data.trajectories) intel.data.trajectories = [];
     intel.data.trajectories.push(traj);
     delete trajectories[latestTrajId];
+
+    // Close the routing learning loop (#517): when the trajectory knows which
+    // agent did the work, record the outcome under the agent-routing state
+    // key that `hooks route` / engine.route() actually query.
+    let learnedRoute = null;
+    if (traj.agent && traj.agent !== 'unknown') {
+      learnedRoute = intel.recordRouteOutcome(traj.context, traj.file || undefined, traj.agent, quality);
+    }
     intel.save();
 
     console.log(JSON.stringify({
@@ -4342,7 +4411,8 @@ hooksCmd.command('trajectory-end')
       trajectory_id: latestTrajId,
       steps: traj.steps.length,
       duration_ms: traj.endTime - traj.startTime,
-      quality
+      quality,
+      ...(learnedRoute ? { learned_route: learnedRoute } : {})
     }));
   });
 
@@ -4416,9 +4486,30 @@ hooksCmd.command('error-suggest')
 hooksCmd.command('force-learn')
   .description('Force an immediate learning cycle')
   .action(() => {
-    const intel = new Intelligence({ skipEngine: true });  // Fast mode
-    intel.tick();
-    console.log(JSON.stringify({ success: true, result: 'Learning cycle triggered', stats: intel.stats() }));
+    try {
+      // Engine enabled: tick()/forceLearn() only exist on the native IntelligenceEngine,
+      // not on this lightweight Intelligence wrapper (see issue #529).
+      const intel = new Intelligence();
+      const eng = intel.getEngine();
+      let success = false;
+      let result;
+      if (eng && typeof eng.forceLearn === 'function') {
+        try {
+          const learnResult = eng.forceLearn();
+          if (typeof eng.tick === 'function') eng.tick();
+          result = learnResult || 'Engine learning cycle complete';
+          success = true;
+        } catch (e) {
+          result = `Engine learning failed: ${e.message}`;
+        }
+      } else {
+        result = 'Native intelligence engine unavailable; no learning cycle performed';
+      }
+      try { intel.save(); } catch {}
+      console.log(JSON.stringify({ success, engineEnabled: !!eng, result, stats: intel.stats() }));
+    } catch (e) {
+      console.log(JSON.stringify({ success: false, engineEnabled: false, result: `force-learn failed: ${e.message}` }));
+    }
   });
 
 // ============================================
