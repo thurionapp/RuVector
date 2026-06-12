@@ -50,11 +50,30 @@ chain link; forging either requires the chain key.
 Appends accumulate each record's `chain_mac` as a Merkle leaf (a memcpy).
 `WitnessLogV2::seal_segment` computes the segment's Merkle root
 (domain-separated: leaf = `BLAKE3(0x00 || seq || mac)`, node =
-`BLAKE3(0x01 || l || r)`) and signs
-`BLAKE3(0x02 || root || first_seq || count)` -- one signature per segment
-(default 256 records), CT/QMDB-style, off the per-record path. Sealed
-roots can be anchored externally; `SegmentAccumulator::inclusion_proof`
-exports per-record Merkle inclusion proofs verified by `verify_inclusion`.
+`BLAKE3(0x01 || l || r)`) and signs the chained seal digest
+`BLAKE3(0x02 || root || first_seq || count || prev_seal_digest)` -- one
+signature per segment (default 256 records), CT/QMDB-style, off the
+per-record path. Sealed roots can be anchored externally;
+`SegmentAccumulator::inclusion_proof` exports per-record Merkle inclusion
+proofs verified by `verify_inclusion`.
+
+Hardening (seal-time only, zero per-append cost):
+
+- **Chained seals (R1)** -- each seal binds its predecessor's digest
+  (genesis constant for the first), so append-only ordering of the whole
+  sealed history is verifiable from seals alone via `verify_seal_chain`
+  (`verify_seal_chain_binding` needs no key at all). Splice, reorder,
+  omission, and cross-log transplant all break the binding.
+- **Key ratchet (R4)** -- every seal ratchets the chain MAC key
+  (`ratchet_chain_key`) and erases the old one, atomically with the
+  seal. Compromise window = the current unsealed segment only; verifiers
+  holding the initial key re-derive all epochs
+  (`verify_chain_v2_ratcheted`).
+- **Coverage policy (R6)** -- `CoveragePolicy::Strict` (via
+  `WitnessLogV2::with_policy`) makes `try_append` return backpressure
+  (`CoverageError`) instead of silently dropping Merkle coverage or
+  overwriting unsealed records. Pre-existing constructors keep
+  `BestEffort` counter behavior.
 
 ## v1 Record Layout (64 bytes, legacy)
 

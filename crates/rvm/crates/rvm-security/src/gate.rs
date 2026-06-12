@@ -68,6 +68,11 @@ pub enum SecurityError {
     PolicyViolation,
     /// P3 deep proof failed: derivation chain broken.
     DerivationChainBroken,
+    /// The witness log refused the emission under
+    /// [`rvm_witness::CoveragePolicy::Strict`] (segment full or the
+    /// ring would overwrite an unsealed record). The mutation must not
+    /// proceed ("no witness, no mutation"); seal the segment and retry.
+    WitnessBackpressure,
     /// An internal error occurred.
     Internal(RvmError),
 }
@@ -432,7 +437,7 @@ impl<'a, const N: usize, const SEG: usize> SecurityGateV2<'a, N, SEG> {
             proof_tier = 3;
         }
 
-        let seq = self.emit_allowed(request, proof_tier);
+        let seq = self.emit_allowed(request, proof_tier)?;
 
         Ok(GateResponse {
             witness_sequence: seq,
@@ -441,7 +446,13 @@ impl<'a, const N: usize, const SEG: usize> SecurityGateV2<'a, N, SEG> {
     }
 
     /// Emit a v2 witness record for an allowed operation.
-    fn emit_allowed(&self, request: &GateRequest, proof_tier: u8) -> u64 {
+    ///
+    /// Uses [`rvm_witness::WitnessLogV2::try_append`] so a
+    /// [`rvm_witness::CoveragePolicy::Strict`] log can refuse the
+    /// emission; per "no witness, no mutation" the gate then fails the
+    /// request with [`SecurityError::WitnessBackpressure`] instead of
+    /// proceeding with degraded audit coverage.
+    fn emit_allowed(&self, request: &GateRequest, proof_tier: u8) -> Result<u64, SecurityError> {
         let mut record = rvm_types::WitnessRecordV2::zeroed();
         record.action_kind = request.action as u8;
         record.proof_tier = proof_tier;
@@ -449,10 +460,16 @@ impl<'a, const N: usize, const SEG: usize> SecurityGateV2<'a, N, SEG> {
         record.target_object_id = request.target_object_id;
         record.capability_hash = request.token.truncated_hash();
         record.timestamp_ns = request.timestamp_ns;
-        self.witness_log.append(record)
+        self.witness_log
+            .try_append(record)
+            .map_err(|_| SecurityError::WitnessBackpressure)
     }
 
     /// Emit a v2 `ProofRejected` witness record for a denied operation.
+    ///
+    /// Rejections use the best-effort append path so a denial is never
+    /// blocked by coverage backpressure (the denied mutation does not
+    /// proceed either way; the rejection record stays chain-protected).
     fn emit_rejection(&self, request: &GateRequest) {
         let mut record = rvm_types::WitnessRecordV2::zeroed();
         record.action_kind = ActionKind::ProofRejected as u8;
@@ -996,5 +1013,41 @@ mod tests {
         assert_eq!(log.snapshot(&mut records), 3);
         let key = log.chain_key();
         assert_eq!(rvm_witness::verify_chain_v2(&records, &key), Ok(3));
+    }
+
+    #[test]
+    fn test_gate_v2_strict_log_backpressure() {
+        use rvm_witness::{CoveragePolicy, derive_chain_key};
+
+        let log = rvm_witness::WitnessLogV2::<16, 2>::with_policy(
+            derive_chain_key(b"gate-strict"),
+            CoveragePolicy::Strict,
+        );
+        let gate = SecurityGateV2::new(&log);
+        let request = |i: u64| GateRequest {
+            token: make_token(CapType::Partition, CapRights::READ),
+            required_type: CapType::Partition,
+            required_rights: CapRights::READ,
+            proof_commitment: None,
+            require_p3: false,
+            p3_chain_valid: false,
+            p3_witness_data: None,
+            action: ActionKind::PartitionCreate,
+            target_object_id: i,
+            timestamp_ns: i * 100,
+        };
+
+        gate.check_and_execute(&request(0)).unwrap();
+        gate.check_and_execute(&request(1)).unwrap();
+        // Segment (SEG = 2) is full: the mutation must not proceed.
+        let err = gate.check_and_execute(&request(2)).unwrap_err();
+        assert_eq!(err, SecurityError::WitnessBackpressure);
+        assert_eq!(log.total_emitted(), 2);
+        assert_eq!(log.segment_dropped(), 0);
+        // Sealing relieves the backpressure.
+        let signer = rvm_witness::Blake3SealSigner::new([0x42u8; 32]);
+        assert!(log.seal_segment(&signer).is_some());
+        let response = gate.check_and_execute(&request(2)).unwrap();
+        assert_eq!(response.witness_sequence, 2);
     }
 }

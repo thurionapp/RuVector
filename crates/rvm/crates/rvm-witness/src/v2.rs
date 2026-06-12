@@ -18,8 +18,40 @@
 //! evidence for exported segments comes from Merkle sealing (see
 //! [`crate::seal`]), which amortizes one signature over a whole
 //! segment instead of paying HMAC per record.
+//!
+//! # Forward security (R4): per-segment chain-key ratchet
+//!
+//! Every [`WitnessLogV2::seal_segment`] ratchets the chain MAC key
+//! (`key_{n+1} = derive_key(`[`RATCHET_CONTEXT`]`, key_n)`) and erases
+//! the old key, atomically with the seal (same lock, no window where
+//! the pre-ratchet key persists after the seal). Consequences:
+//!
+//! - **Compromise window = the current unsealed segment only.** An
+//!   attacker who extracts the live key can forge records of the
+//!   current epoch, but cannot recompute MACs of any earlier epoch
+//!   (`derive_key` is one-way), and earlier segments are additionally
+//!   pinned by their Merkle seals and the seal chain (R1).
+//! - **Verifier capability is asymmetric by design**: the holder of
+//!   the *initial* key re-derives every epoch key and can verify the
+//!   whole log ([`crate::verify_chain_v2_ratcheted`]); the logger
+//!   itself can no longer forge history older than its last ratchet.
+//! - Epoch boundaries are the log's `sequence` at each seal. Under
+//!   [`CoveragePolicy::Strict`] this equals
+//!   `seal.first_sequence + seal.count` of each chained seal, so the
+//!   boundaries are recoverable from the seals alone.
+//!
+//! # Coverage invariants (R6)
+//!
+//! [`CoveragePolicy::Strict`] turns the two silent coverage-loss modes
+//! (`segment_dropped`, `total_overwritten` of unsealed records) into
+//! [`CoverageError`] backpressure from [`WitnessLogV2::try_append`].
+//! [`CoveragePolicy::BestEffort`] preserves the original counter
+//! behavior; all pre-existing constructors keep it for stability.
 
-use crate::seal::{SealedSegment, SegmentAccumulator, SegmentSealSigner, DEFAULT_SEGMENT_SIZE};
+use crate::seal::{
+    seal_chain_genesis, SealedSegment, SegmentAccumulator, SegmentSealSigner,
+    DEFAULT_SEGMENT_SIZE,
+};
 use rvm_types::{WitnessRecord, WitnessRecordV2};
 use spin::Mutex;
 
@@ -40,6 +72,79 @@ pub fn derive_chain_key(material: &[u8]) -> [u8; 32] {
 #[must_use]
 pub fn default_chain_key() -> [u8; 32] {
     derive_chain_key(b"rvm-witness-default-chain-key-v2")
+}
+
+/// Domain-separation context string for the forward-secure chain-key
+/// ratchet (R4): `key_{n+1} = blake3::derive_key(RATCHET_CONTEXT, key_n)`.
+pub const RATCHET_CONTEXT: &str = "rvm-witness 2026 v2 chain key ratchet";
+
+/// Derive the next epoch's chain key from the current one (one-way).
+///
+/// Applied by [`WitnessLogV2::seal_segment`] once per seal; verifiers
+/// holding the initial key re-derive the same sequence (see
+/// [`crate::verify_chain_v2_ratcheted`]).
+#[must_use]
+pub fn ratchet_chain_key(key: &[u8; 32]) -> [u8; 32] {
+    blake3::derive_key(RATCHET_CONTEXT, key)
+}
+
+/// Best-effort secure erasure of 32-byte key material.
+///
+/// `no_std` + `forbid(unsafe_code)` rules out `write_volatile`-based
+/// zeroization; this overwrites with zeros and pins the writes with
+/// [`core::hint::black_box`] so the compiler cannot elide them as dead
+/// stores. Transient copies inside `blake3` internals are out of reach
+/// and remain a documented limitation.
+pub fn erase_key(key: &mut [u8; 32]) {
+    for byte in key.iter_mut() {
+        *byte = 0;
+    }
+    core::hint::black_box(key);
+}
+
+/// Coverage policy for a [`WitnessLogV2`] (R6): whether losing Merkle
+/// coverage or overwriting unsealed records is an error or a counter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoveragePolicy {
+    /// Coverage is an invariant. [`WitnessLogV2::try_append`] returns
+    /// [`CoverageError::SegmentFull`] instead of dropping a Merkle leaf
+    /// and [`CoverageError::UnsealedOverwrite`] instead of letting the
+    /// ring overwrite a record that was never sealed (backpressure:
+    /// seal, then retry). Recommended for all new code.
+    Strict,
+    /// Original behavior: appends never fail; coverage loss is only
+    /// counted ([`WitnessLogV2::segment_dropped`],
+    /// [`WitnessLogV2::total_overwritten`]). For callers that cannot
+    /// seal synchronously.
+    BestEffort,
+}
+
+/// Backpressure errors from [`WitnessLogV2::try_append`] under
+/// [`CoveragePolicy::Strict`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoverageError {
+    /// The segment accumulator is full: appending would leave the
+    /// record without Merkle coverage. Seal the segment
+    /// ([`WitnessLogV2::seal_segment`]) and retry.
+    SegmentFull,
+    /// The ring slot to be reused still holds a never-sealed record
+    /// (its sequence number is given). Seal and export before
+    /// appending.
+    UnsealedOverwrite {
+        /// Sequence number of the unsealed record that would be lost.
+        sequence: u64,
+    },
+}
+
+impl core::fmt::Display for CoverageError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::SegmentFull => write!(f, "segment full: seal before appending"),
+            Self::UnsealedOverwrite { sequence } => {
+                write!(f, "ring overwrite would lose unsealed record {sequence}")
+            }
+        }
+    }
 }
 
 /// Compute a v2 chain MAC: `trunc128(BLAKE3_keyed(key, content || prev_mac))`.
@@ -88,6 +193,18 @@ struct Inner<const N: usize, const SEG: usize> {
     /// Records appended while the current segment was already full
     /// (their leaves were NOT accumulated; seal more often to avoid).
     segment_dropped: u64,
+    /// Coverage policy (R6). Enforced by `try_append`.
+    policy: CoveragePolicy,
+    /// Sequence watermark at the last seal: records with a sequence
+    /// below this have had seal coverage. Exact under `Strict` (no
+    /// leaves are ever dropped); under `BestEffort`, dropped records
+    /// below the watermark were never actually sealed.
+    sealed_up_to: u64,
+    /// Digest of the most recent seal, or `seal_chain_genesis()` if no
+    /// segment has been sealed yet (R1 chaining state).
+    last_seal_digest: [u8; 32],
+    /// Number of key ratchets performed (= number of seals; R4).
+    key_epoch: u64,
 }
 
 impl<const N: usize, const SEG: usize> WitnessLogV2<N, SEG> {
@@ -116,8 +233,31 @@ impl<const N: usize, const SEG: usize> WitnessLogV2<N, SEG> {
     /// [`crate::versioned::v1_head_to_genesis`] of the verified v1 chain
     /// head so the first v2 record's `prev_mac` cryptographically binds
     /// the v1 history.
+    ///
+    /// Coverage policy is [`CoveragePolicy::BestEffort`], matching the
+    /// behavior this constructor always had; new code should prefer
+    /// [`Self::with_policy`] / [`Self::with_genesis_and_policy`] with
+    /// [`CoveragePolicy::Strict`].
     #[must_use]
     pub fn with_key_and_genesis(key: [u8; 32], genesis: [u8; 16]) -> Self {
+        Self::with_genesis_and_policy(key, genesis, CoveragePolicy::BestEffort)
+    }
+
+    /// Create an empty v2 log with an explicit coverage policy (R6) and
+    /// the zero genesis. Use [`CoveragePolicy::Strict`] unless the
+    /// caller genuinely cannot seal synchronously.
+    #[must_use]
+    pub fn with_policy(key: [u8; 32], policy: CoveragePolicy) -> Self {
+        Self::with_genesis_and_policy(key, [0u8; 16], policy)
+    }
+
+    /// Create an empty v2 log with explicit genesis and coverage policy.
+    #[must_use]
+    pub fn with_genesis_and_policy(
+        key: [u8; 32],
+        genesis: [u8; 16],
+        policy: CoveragePolicy,
+    ) -> Self {
         let () = Self::_ASSERT_N_NONZERO;
         let () = Self::_ASSERT_SEG_NONZERO;
         Self {
@@ -132,6 +272,10 @@ impl<const N: usize, const SEG: usize> WitnessLogV2<N, SEG> {
                 key,
                 segment: SegmentAccumulator::new(0),
                 segment_dropped: 0,
+                policy,
+                sealed_up_to: 0,
+                last_seal_digest: seal_chain_genesis(),
+                key_epoch: 0,
             }),
         }
     }
@@ -144,9 +288,55 @@ impl<const N: usize, const SEG: usize> WitnessLogV2<N, SEG> {
     /// Cost: one keyed BLAKE3 compression (60-byte input) plus
     /// bookkeeping. No per-record signature is computed; use
     /// [`Self::seal_segment`] for exportable tamper evidence.
-    pub fn append(&self, mut record: WitnessRecordV2) -> u64 {
+    ///
+    /// This entry point is infallible and therefore always has
+    /// [`CoveragePolicy::BestEffort`] semantics (coverage loss is
+    /// counted, never refused) **even on a
+    /// [`CoveragePolicy::Strict`] log**. Strict callers must use
+    /// [`Self::try_append`] to get backpressure instead of silent
+    /// coverage loss.
+    pub fn append(&self, record: WitnessRecordV2) -> u64 {
         let mut inner = self.inner.lock();
+        Self::append_locked(&mut inner, record)
+    }
 
+    /// Append a v2 record, enforcing the log's [`CoveragePolicy`] (R6).
+    ///
+    /// Under [`CoveragePolicy::Strict`] this fails — *before* mutating
+    /// any state — when the record would lose coverage:
+    ///
+    /// - [`CoverageError::SegmentFull`]: the segment accumulator holds
+    ///   `SEG` leaves; the record's MAC could not be accumulated for
+    ///   Merkle sealing. Seal ([`Self::seal_segment`]) and retry.
+    /// - [`CoverageError::UnsealedOverwrite`]: the ring is full and the
+    ///   slot to be reused holds a record that was never sealed.
+    ///
+    /// Under [`CoveragePolicy::BestEffort`] it never fails (identical
+    /// to [`Self::append`]).
+    ///
+    /// # Errors
+    ///
+    /// See above; only returned for `Strict` logs.
+    pub fn try_append(&self, record: WitnessRecordV2) -> Result<u64, CoverageError> {
+        let mut inner = self.inner.lock();
+        if inner.policy == CoveragePolicy::Strict {
+            if inner.segment.is_full() {
+                return Err(CoverageError::SegmentFull);
+            }
+            if inner.total_emitted >= N as u64 {
+                // The slot being reused holds the record appended N
+                // sequence numbers ago.
+                let victim = inner.sequence.wrapping_sub(N as u64);
+                if victim >= inner.sealed_up_to {
+                    return Err(CoverageError::UnsealedOverwrite { sequence: victim });
+                }
+            }
+        }
+        Ok(Self::append_locked(&mut inner, record))
+    }
+
+    /// Shared append path (caller holds the lock).
+    fn append_locked(inner: &mut Inner<N, SEG>, mut record: WitnessRecordV2) -> u64 {
         record.version = WitnessRecordV2::VERSION;
         record.sequence = inner.sequence;
         record.prev_mac = inner.head_mac;
@@ -193,6 +383,20 @@ impl<const N: usize, const SEG: usize> WitnessLogV2<N, SEG> {
     ///
     /// This is the **only** place signature cost is paid: one signature
     /// per up-to-`SEG` records, off the per-record append path.
+    ///
+    /// Hardening performed atomically with the seal (same lock):
+    ///
+    /// - **R1**: the seal is [chained](crate::seal::SEAL_VERSION_CHAINED)
+    ///   — its digest binds the previous seal's digest (genesis constant
+    ///   for the first seal), so sealed history ordering is verifiable
+    ///   from seals alone via [`crate::verify_seal_chain`].
+    /// - **R4**: the chain MAC key is ratcheted
+    ///   ([`ratchet_chain_key`]) and the old key erased before the lock
+    ///   is released — there is no window in which the pre-seal key
+    ///   outlives the seal. After this returns, even this log cannot
+    ///   forge records of the sealed (or any earlier) epoch; verify
+    ///   multi-epoch logs with [`crate::verify_chain_v2_ratcheted`]
+    ///   from the *initial* key.
     pub fn seal_segment<G: SegmentSealSigner>(
         &self,
         signer: &G,
@@ -202,8 +406,17 @@ impl<const N: usize, const SEG: usize> WitnessLogV2<N, SEG> {
             return None;
         }
         let acc = inner.segment;
-        let sealed = acc.seal(signer)?;
+        let sealed = acc.seal_chained(signer, &inner.last_seal_digest)?;
+        inner.last_seal_digest = sealed.digest();
+        inner.sealed_up_to = inner.sequence;
         inner.segment = SegmentAccumulator::new(inner.sequence);
+        // R4 ratchet: derive the next epoch key and destroy the old
+        // one. `inner.key = next` overwrites the old key bytes in
+        // place; the stack copy of the new key is then erased.
+        let mut next = ratchet_chain_key(&inner.key);
+        inner.key = next;
+        erase_key(&mut next);
+        inner.key_epoch += 1;
         Some((sealed, acc))
     }
 
@@ -220,9 +433,40 @@ impl<const N: usize, const SEG: usize> WitnessLogV2<N, SEG> {
         self.inner.lock().genesis
     }
 
-    /// The 32-byte chain MAC key (needed by verifiers; treat as secret).
+    /// The **current-epoch** 32-byte chain MAC key (treat as secret).
+    ///
+    /// After `n` seals this is `key_n` (R4 ratchet): it verifies only
+    /// records appended since the last seal. Verifiers of full logs
+    /// must hold the *initial* key and re-derive epochs via
+    /// [`ratchet_chain_key`] / [`crate::verify_chain_v2_ratcheted`].
     pub fn chain_key(&self) -> [u8; 32] {
         self.inner.lock().key
+    }
+
+    /// Number of chain-key ratchets performed (= seals; R4). The
+    /// current [`Self::chain_key`] is `key_epoch` derivations from the
+    /// initial key.
+    pub fn key_epoch(&self) -> u64 {
+        self.inner.lock().key_epoch
+    }
+
+    /// This log's coverage policy (R6).
+    pub fn coverage_policy(&self) -> CoveragePolicy {
+        self.inner.lock().policy
+    }
+
+    /// Sequence watermark at the last seal: records below it have had
+    /// seal coverage (exact under [`CoveragePolicy::Strict`]).
+    pub fn sealed_up_to(&self) -> u64 {
+        self.inner.lock().sealed_up_to
+    }
+
+    /// Digest of the most recent seal ([`SealedSegment::digest`]), or
+    /// [`seal_chain_genesis`] if nothing has been sealed. The next seal
+    /// will bind this value (R1); export it alongside the chain head
+    /// for external anchoring.
+    pub fn last_seal_digest(&self) -> [u8; 32] {
+        self.inner.lock().last_seal_digest
     }
 
     /// Number of leaves in the current (unsealed) segment.
@@ -438,5 +682,199 @@ mod tests {
         // Appending past a full segment drops leaves (counted).
         log.append(make_record(ActionKind::SchedulerEpoch, 1, 4, 4));
         assert_eq!(log.segment_dropped(), 1);
+    }
+
+    // ---- R4: forward-secure chain-key ratchet ------------------------
+
+    fn test_seal_signer() -> crate::seal::Blake3SealSigner {
+        crate::seal::Blake3SealSigner::new([0x42u8; 32])
+    }
+
+    #[test]
+    fn ratchet_is_deterministic_and_changes_key() {
+        let k0 = derive_chain_key(b"epoch-test");
+        assert_eq!(ratchet_chain_key(&k0), ratchet_chain_key(&k0));
+        assert_ne!(ratchet_chain_key(&k0), k0);
+        assert_ne!(ratchet_chain_key(&ratchet_chain_key(&k0)), ratchet_chain_key(&k0));
+    }
+
+    #[test]
+    fn seal_ratchets_key_atomically() {
+        let signer = test_seal_signer();
+        let log = WitnessLogV2::<64, 8>::new();
+        let key0 = log.chain_key();
+        assert_eq!(log.key_epoch(), 0);
+
+        log.append(make_record(ActionKind::SchedulerEpoch, 1, 0, 0));
+        log.seal_segment(&signer).unwrap();
+        assert_eq!(log.key_epoch(), 1);
+        // Verifier re-derivation matches the live key exactly.
+        assert_eq!(log.chain_key(), ratchet_chain_key(&key0));
+        assert_ne!(log.chain_key(), key0);
+
+        log.append(make_record(ActionKind::SchedulerEpoch, 1, 1, 1));
+        log.seal_segment(&signer).unwrap();
+        assert_eq!(log.key_epoch(), 2);
+        assert_eq!(log.chain_key(), ratchet_chain_key(&ratchet_chain_key(&key0)));
+
+        // Sealing an empty segment performs no ratchet (no seal, no
+        // key event — atomicity in both directions).
+        assert!(log.seal_segment(&signer).is_none());
+        assert_eq!(log.key_epoch(), 2);
+    }
+
+    #[test]
+    fn records_after_ratchet_use_new_key() {
+        let signer = test_seal_signer();
+        let log = WitnessLogV2::<64, 8>::new();
+        let key0 = log.chain_key();
+        log.append(make_record(ActionKind::SchedulerEpoch, 1, 0, 0));
+        log.seal_segment(&signer).unwrap();
+        log.append(make_record(ActionKind::SchedulerEpoch, 1, 1, 1));
+
+        let r0 = log.get(0).unwrap();
+        let r1 = log.get(1).unwrap();
+        let key1 = ratchet_chain_key(&key0);
+        let b0 = r0.to_bytes();
+        let b1 = r1.to_bytes();
+        assert_eq!(
+            r0.chain_mac,
+            compute_chain_mac_v2(&key0, &b0[..WitnessRecordV2::CONTENT_LEN], &r0.prev_mac)
+        );
+        assert_eq!(
+            r1.chain_mac,
+            compute_chain_mac_v2(&key1, &b1[..WitnessRecordV2::CONTENT_LEN], &r1.prev_mac)
+        );
+        // The chain itself continues across the epoch boundary.
+        assert_eq!(r1.prev_mac, r0.chain_mac);
+        // The pre-ratchet key cannot produce the epoch-1 MAC.
+        assert_ne!(
+            r1.chain_mac,
+            compute_chain_mac_v2(&key0, &b1[..WitnessRecordV2::CONTENT_LEN], &r1.prev_mac)
+        );
+    }
+
+    #[test]
+    fn erase_key_zeroes_buffer() {
+        let mut key = [0xA7u8; 32];
+        erase_key(&mut key);
+        assert_eq!(key, [0u8; 32]);
+    }
+
+    // ---- R1: seals from the log form a verifiable chain --------------
+
+    #[test]
+    fn log_seals_form_verifiable_chain() {
+        let signer = test_seal_signer();
+        let log = WitnessLogV2::<64, 4>::with_policy(
+            derive_chain_key(b"chain-test"),
+            CoveragePolicy::Strict,
+        );
+        let mut seq = 0u64;
+        let mut seal = |(): ()| {
+            for _ in 0..4 {
+                log.try_append(make_record(ActionKind::SchedulerEpoch, 1, seq, seq))
+                    .unwrap();
+                seq += 1;
+            }
+            log.seal_segment(&signer).unwrap().0
+        };
+        let seals = [seal(()), seal(()), seal(())];
+        assert_eq!(crate::seal::verify_seal_chain(&seals, &signer), Ok(3));
+        assert_eq!(log.last_seal_digest(), seals[2].digest());
+        // Under Strict, epoch boundaries are recoverable from seals:
+        // first_sequence + count of each seal.
+        assert_eq!(seals[0].first_sequence + u64::from(seals[0].count), 4);
+        assert_eq!(seals[1].first_sequence, 4);
+        assert_eq!(seals[2].first_sequence, 8);
+    }
+
+    // ---- R6: coverage policy ------------------------------------------
+
+    #[test]
+    fn strict_segment_full_is_backpressure_not_drop() {
+        let signer = test_seal_signer();
+        let log = WitnessLogV2::<64, 4>::with_policy(
+            default_chain_key(),
+            CoveragePolicy::Strict,
+        );
+        assert_eq!(log.coverage_policy(), CoveragePolicy::Strict);
+        for i in 0..4u64 {
+            assert!(log
+                .try_append(make_record(ActionKind::SchedulerEpoch, 1, i, i))
+                .is_ok());
+        }
+        let rec = make_record(ActionKind::SchedulerEpoch, 1, 4, 4);
+        assert_eq!(log.try_append(rec), Err(CoverageError::SegmentFull));
+        // The refused append mutated nothing.
+        assert_eq!(log.total_emitted(), 4);
+        assert_eq!(log.segment_dropped(), 0);
+        // Seal-then-append succeeds.
+        assert!(log.seal_segment(&signer).is_some());
+        assert_eq!(log.try_append(rec), Ok(4));
+        assert_eq!(log.segment_dropped(), 0);
+    }
+
+    #[test]
+    fn strict_refuses_unsealed_ring_overwrite() {
+        let signer = test_seal_signer();
+        let log = WitnessLogV2::<4, 8>::with_policy(
+            default_chain_key(),
+            CoveragePolicy::Strict,
+        );
+        for i in 0..4u64 {
+            log.try_append(make_record(ActionKind::SchedulerEpoch, 1, i, i))
+                .unwrap();
+        }
+        // Ring full, nothing sealed: record 0 would be lost.
+        assert_eq!(
+            log.try_append(make_record(ActionKind::SchedulerEpoch, 1, 4, 4)),
+            Err(CoverageError::UnsealedOverwrite { sequence: 0 })
+        );
+        assert_eq!(log.total_overwritten(), 0);
+        assert_eq!(log.total_emitted(), 4);
+        // Sealing covers records 0..4; overwriting them is now allowed.
+        assert!(log.seal_segment(&signer).is_some());
+        assert_eq!(
+            log.try_append(make_record(ActionKind::SchedulerEpoch, 1, 4, 4)),
+            Ok(4)
+        );
+        assert_eq!(log.total_overwritten(), 1);
+    }
+
+    #[test]
+    fn strict_stress_keeps_coverage_invariant() {
+        let signer = test_seal_signer();
+        let log = WitnessLogV2::<8, 4>::with_policy(
+            default_chain_key(),
+            CoveragePolicy::Strict,
+        );
+        for i in 0..100u64 {
+            let rec = make_record(ActionKind::SchedulerEpoch, 1, i, i);
+            if log.try_append(rec).is_err() {
+                log.seal_segment(&signer).unwrap();
+                log.try_append(rec).unwrap();
+            }
+        }
+        assert_eq!(log.total_emitted(), 100);
+        assert_eq!(log.segment_dropped(), 0);
+        // Every record is either sealed or in the live segment.
+        assert_eq!(log.sealed_up_to() + log.segment_len() as u64, 100);
+    }
+
+    #[test]
+    fn best_effort_try_append_never_fails() {
+        // Existing-constructor logs keep the original semantics: no
+        // backpressure, losses counted exactly as before.
+        let log = WitnessLogV2::<4, 2>::new();
+        assert_eq!(log.coverage_policy(), CoveragePolicy::BestEffort);
+        for i in 0..10u64 {
+            assert!(log
+                .try_append(make_record(ActionKind::SchedulerEpoch, 1, i, i))
+                .is_ok());
+        }
+        assert_eq!(log.total_emitted(), 10);
+        assert_eq!(log.segment_dropped(), 8);
+        assert_eq!(log.total_overwritten(), 6);
     }
 }

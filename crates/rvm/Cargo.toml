@@ -4,6 +4,7 @@ members = [
     "crates/rvm-hal",
     "crates/rvm-cap",
     "crates/rvm-witness",
+    "crates/rvm-checkpoint",
     "crates/rvm-proof",
     "crates/rvm-partition",
     "crates/rvm-sched",
@@ -33,6 +34,7 @@ rvm-types = { path = "crates/rvm-types" }
 rvm-hal = { path = "crates/rvm-hal" }
 rvm-cap = { path = "crates/rvm-cap" }
 rvm-witness = { path = "crates/rvm-witness" }
+rvm-checkpoint = { path = "crates/rvm-checkpoint" }
 rvm-proof = { path = "crates/rvm-proof" }
 rvm-partition = { path = "crates/rvm-partition" }
 rvm-sched = { path = "crates/rvm-sched" }

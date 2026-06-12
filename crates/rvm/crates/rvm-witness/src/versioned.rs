@@ -133,6 +133,52 @@ fn verify_record_v2(
     Ok(())
 }
 
+/// Verify a contiguous slice of v2 records that spans multiple chain-key
+/// epochs (R4 ratchet).
+///
+/// `initial_key` is the key the log was created with (`key_0`);
+/// `epoch_boundaries` lists, in ascending order, the sequence number at
+/// which each ratchet fired (the log's `sequence` at each seal): records
+/// with `sequence >= epoch_boundaries[k]` are verified under
+/// `key_{k+1} = ratchet_chain_key(key_k)`. Under
+/// [`crate::CoveragePolicy::Strict`] each boundary equals
+/// `seal.first_sequence + seal.count` of the corresponding chained seal,
+/// so the boundaries are recoverable from the seal chain alone; under
+/// `BestEffort` with dropped leaves the boundary is the *next* seal's
+/// `first_sequence`.
+///
+/// Capability asymmetry (the point of the ratchet): the holder of
+/// `key_0` can verify the entire log, while the logger — which only
+/// retains the latest epoch key — can no longer forge any record older
+/// than its last seal.
+///
+/// # Errors
+///
+/// Same as [`verify_chain_v2_from`].
+pub fn verify_chain_v2_ratcheted(
+    records: &[WitnessRecordV2],
+    initial_key: &[u8; 32],
+    genesis: &[u8; 16],
+    epoch_boundaries: &[u64],
+) -> Result<usize, ChainIntegrityErrorV2> {
+    if records.is_empty() {
+        return Err(ChainIntegrityErrorV2::EmptyLog);
+    }
+    let mut key = *initial_key;
+    let mut head: [u8; 16] = *genesis;
+    let mut next_boundary = 0usize;
+    for record in records {
+        while next_boundary < epoch_boundaries.len()
+            && record.sequence >= epoch_boundaries[next_boundary]
+        {
+            key = crate::v2::ratchet_chain_key(&key);
+            next_boundary += 1;
+        }
+        verify_record_v2(record, &key, &mut head)?;
+    }
+    Ok(records.len())
+}
+
 /// Map a verified v1 chain head (the 64-bit running chain value) into a
 /// 16-byte v2 genesis: `trunc128(BLAKE3("rvm-witness v1->v2 genesis" || head))`.
 ///
@@ -502,6 +548,153 @@ mod tests {
         let (records, _key) = build_v2_chain(3);
         let wrong = crate::v2::derive_chain_key(b"not-the-key");
         assert!(verify_chain_v2(&records, &wrong).is_err());
+    }
+
+    // ---- R4: ratcheted multi-epoch verification ---------------------
+
+    use crate::seal::{
+        verify_inclusion, verify_seal, verify_seal_chain, Blake3SealSigner,
+    };
+    use crate::v2::{ratchet_chain_key, CoveragePolicy};
+
+    #[test]
+    fn ratcheted_chain_verifies_with_rederived_keys() {
+        let signer = Blake3SealSigner::new([9u8; 32]);
+        let key0 = crate::v2::derive_chain_key(b"ratchet-verify");
+        let log = WitnessLogV2::<64, 4>::with_policy(key0, CoveragePolicy::Strict);
+        let mut boundaries = Vec::new();
+        let mut seals = Vec::new();
+        for i in 0..12u64 {
+            let mut r = WitnessRecordV2::zeroed();
+            r.target_object_id = i;
+            log.try_append(r).unwrap();
+            if (i + 1) % 4 == 0 {
+                let (sealed, _) = log.seal_segment(&signer).unwrap();
+                // Strict: epoch boundary recoverable from the seal.
+                boundaries.push(sealed.first_sequence + u64::from(sealed.count));
+                seals.push(sealed);
+            }
+        }
+        let mut records = alloc::vec![WitnessRecordV2::zeroed(); 12];
+        assert_eq!(log.snapshot(&mut records), 12);
+
+        // No single key verifies across epochs any more.
+        assert!(verify_chain_v2(&records, &key0).is_err());
+        assert!(verify_chain_v2(&records, &log.chain_key()).is_err());
+        // The initial-key holder re-derives every epoch (determinism).
+        assert_eq!(
+            verify_chain_v2_ratcheted(&records, &key0, &[0u8; 16], &boundaries),
+            Ok(12)
+        );
+        // Wrong boundaries pair records with the wrong epoch key.
+        assert!(verify_chain_v2_ratcheted(&records, &key0, &[0u8; 16], &[3, 8, 12]).is_err());
+        // The seals the boundaries came from are themselves a valid chain.
+        assert_eq!(verify_seal_chain(&seals, &signer), Ok(3));
+    }
+
+    #[test]
+    fn stale_key_cannot_forge_post_ratchet_record() {
+        let signer = Blake3SealSigner::new([9u8; 32]);
+        let log = WitnessLogV2::<16, 8>::new();
+        let key0 = log.chain_key();
+        let mut r = WitnessRecordV2::zeroed();
+        r.target_object_id = 1;
+        log.append(r);
+        log.seal_segment(&signer).unwrap(); // ratchet: key0 retired
+        let mut r = WitnessRecordV2::zeroed();
+        r.target_object_id = 2;
+        log.append(r);
+
+        let mut records = alloc::vec![WitnessRecordV2::zeroed(); 2];
+        log.snapshot(&mut records);
+        let boundaries = [1u64];
+        assert_eq!(
+            verify_chain_v2_ratcheted(&records, &key0, &[0u8; 16], &boundaries),
+            Ok(2)
+        );
+
+        // An attacker who only kept the pre-ratchet key tampers the
+        // epoch-1 record and recomputes its MAC with the stale key.
+        records[1].target_object_id = 0xE71;
+        let bytes = records[1].to_bytes();
+        records[1].chain_mac = compute_chain_mac_v2(
+            &key0,
+            &bytes[..WitnessRecordV2::CONTENT_LEN],
+            &records[1].prev_mac,
+        );
+        assert_eq!(
+            verify_chain_v2_ratcheted(&records, &key0, &[0u8; 16], &boundaries),
+            Err(ChainIntegrityErrorV2::RecordCorrupted { sequence: 1 })
+        );
+    }
+
+    #[test]
+    fn post_compromise_key_cannot_rewrite_sealed_history() {
+        // THE forward-security property: the attacker holds the
+        // *current* (post-ratchet) chain key and rewrites a record in
+        // an already-sealed segment, recomputing every downstream MAC
+        // with the compromised key — the best forgery available
+        // without key_0.
+        let signer = Blake3SealSigner::new([7u8; 32]);
+        let key0 = crate::v2::derive_chain_key(b"compromise-window");
+        let log = WitnessLogV2::<64, 4>::with_policy(key0, CoveragePolicy::Strict);
+        for i in 0..4u64 {
+            let mut r = WitnessRecordV2::zeroed();
+            r.target_object_id = i;
+            log.try_append(r).unwrap();
+        }
+        let (seal0, acc0) = log.seal_segment(&signer).unwrap();
+        for i in 4..6u64 {
+            let mut r = WitnessRecordV2::zeroed();
+            r.target_object_id = i;
+            log.try_append(r).unwrap();
+        }
+        let compromised = log.chain_key(); // attacker's loot: key_1
+        assert_eq!(compromised, ratchet_chain_key(&key0));
+
+        let mut records = alloc::vec![WitnessRecordV2::zeroed(); 6];
+        log.snapshot(&mut records);
+        records[2].payload = [0xEE; 8];
+        let mut head = records[1].chain_mac;
+        for r in &mut records[2..] {
+            r.prev_mac = head;
+            let bytes = r.to_bytes();
+            r.chain_mac = compute_chain_mac_v2(
+                &compromised,
+                &bytes[..WitnessRecordV2::CONTENT_LEN],
+                &r.prev_mac,
+            );
+            head = r.chain_mac;
+        }
+
+        // 1. The initial-key holder rejects: epoch-0 records carry
+        //    MACs the attacker could not have produced.
+        assert_eq!(
+            verify_chain_v2_ratcheted(&records, &key0, &[0u8; 16], &[4]),
+            Err(ChainIntegrityErrorV2::RecordCorrupted { sequence: 2 })
+        );
+
+        // 2. Even WITHOUT key_0, the sealed history catches the
+        //    rewrite: old segments are protected by their SEALS, not
+        //    the (compromised) chain key. The honest leaf still proves
+        //    inclusion; the forged record's MAC does not.
+        let proof = acc0.proof_for_sequence(2).unwrap();
+        assert!(verify_seal(&seal0, &signer));
+        assert!(verify_inclusion(&seal0.root, &acc0.leaf(2).unwrap(), &proof));
+        assert!(!verify_inclusion(&seal0.root, &records[2].chain_mac, &proof));
+    }
+
+    #[test]
+    fn ratcheted_verify_with_no_boundaries_matches_plain() {
+        let (records, key) = build_v2_chain(5);
+        assert_eq!(
+            verify_chain_v2_ratcheted(&records, &key, &[0u8; 16], &[]),
+            Ok(5)
+        );
+        assert_eq!(
+            verify_chain_v2_ratcheted(&[], &key, &[0u8; 16], &[]),
+            Err(ChainIntegrityErrorV2::EmptyLog)
+        );
     }
 
     // ---- v1 backward verification ----------------------------------

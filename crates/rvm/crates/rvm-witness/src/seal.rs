@@ -10,6 +10,12 @@
 //! Domain separation: leaves are hashed as `BLAKE3(0x00 || seq || mac)`
 //! and internal nodes as `BLAKE3(0x01 || left || right)`, preventing
 //! leaf/node confusion attacks. Odd nodes are promoted unchanged.
+//!
+//! Chained seals (R1): each seal produced by
+//! [`crate::WitnessLogV2::seal_segment`] binds the digest of its
+//! predecessor, so the append-only ordering of the entire sealed
+//! history is verifiable **from seals alone** — no chain key required —
+//! via [`verify_seal_chain`] / [`verify_seal_chain_binding`].
 
 /// Default number of leaves per segment.
 ///
@@ -25,6 +31,28 @@ pub const MAX_MERKLE_DEPTH: usize = 32;
 const LEAF_DOMAIN: u8 = 0x00;
 const NODE_DOMAIN: u8 = 0x01;
 const SEAL_DOMAIN: u8 = 0x02;
+
+/// Seal format with the original digest preimage
+/// `BLAKE3(0x02 || root || first_seq || count)` (no cross-segment
+/// binding). Produced by [`SegmentAccumulator::seal`].
+pub const SEAL_VERSION_UNCHAINED: u8 = 2;
+
+/// Seal format whose digest binds the previous segment's seal digest:
+/// `BLAKE3(0x02 || root || first_seq || count || prev_seal_digest)`.
+/// Produced by [`SegmentAccumulator::seal_chained`] and
+/// [`crate::WitnessLogV2::seal_segment`]. Makes append-only ordering of
+/// the whole sealed history verifiable from seals alone (R1).
+pub const SEAL_VERSION_CHAINED: u8 = 3;
+
+/// Domain-derived constant used as the `prev_seal_digest` of the first
+/// (genesis) seal in a chained seal sequence.
+///
+/// Derived rather than all-zero so a genesis link can never collide
+/// with a forged "previous seal" whose digest happens to be zero.
+#[must_use]
+pub fn seal_chain_genesis() -> [u8; 32] {
+    *blake3::hash(b"rvm-witness 2026 v3 seal-chain genesis").as_bytes()
+}
 
 /// Signs and verifies sealed segment roots.
 ///
@@ -112,24 +140,223 @@ pub fn seal_digest(root: &[u8; 32], first_sequence: u64, count: u32) -> [u8; 32]
     *blake3::hash(&buf).as_bytes()
 }
 
+/// Chained ([`SEAL_VERSION_CHAINED`]) seal digest:
+/// `BLAKE3(0x02 || root || first_sequence_le || count_le || prev_seal_digest)`.
+///
+/// Binding the previous segment's seal digest makes the append-only
+/// ordering of an entire sealed history publicly verifiable from the
+/// seals alone (no chain key needed): splicing, reordering, omitting,
+/// or transplanting any seal breaks the binding of its successor. The
+/// 77-byte preimage cannot collide with the 45-byte unchained preimage
+/// even though both use the `0x02` domain byte.
+#[must_use]
+pub fn seal_digest_chained(
+    root: &[u8; 32],
+    first_sequence: u64,
+    count: u32,
+    prev_seal_digest: &[u8; 32],
+) -> [u8; 32] {
+    let mut buf = [0u8; 77];
+    buf[0] = SEAL_DOMAIN;
+    buf[1..33].copy_from_slice(root);
+    buf[33..41].copy_from_slice(&first_sequence.to_le_bytes());
+    buf[41..45].copy_from_slice(&count.to_le_bytes());
+    buf[45..77].copy_from_slice(prev_seal_digest);
+    *blake3::hash(&buf).as_bytes()
+}
+
 /// A sealed Merkle segment: exportable, externally anchorable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SealedSegment {
+    /// Seal format version: [`SEAL_VERSION_UNCHAINED`] (`2`, legacy
+    /// digest preimage) or [`SEAL_VERSION_CHAINED`] (`3`, digest binds
+    /// `prev_seal_digest`). No serialized seal format predates this
+    /// field; it exists so any future persistence layer can verify both
+    /// shapes under the correct rules.
+    pub version: u8,
     /// Merkle root over the segment's record chain MACs.
     pub root: [u8; 32],
     /// Sequence number of the first record in the segment.
     pub first_sequence: u64,
     /// Number of records (leaves) in the segment.
     pub count: u32,
-    /// Signature over [`seal_digest`]`(root, first_sequence, count)`.
+    /// Digest of the previous seal in the chain (chained seals), the
+    /// [`seal_chain_genesis`] constant for the first seal of a log, or
+    /// all-zero for unchained seals (ignored by their digest).
+    pub prev_seal_digest: [u8; 32],
+    /// Signature over [`SealedSegment::digest`].
     pub signature: [u8; 64],
 }
 
-/// Verify a sealed segment's signature.
+impl SealedSegment {
+    /// The digest this seal's signature covers, computed under the
+    /// rules selected by [`Self::version`].
+    #[must_use]
+    pub fn digest(&self) -> [u8; 32] {
+        if self.version == SEAL_VERSION_CHAINED {
+            seal_digest_chained(
+                &self.root,
+                self.first_sequence,
+                self.count,
+                &self.prev_seal_digest,
+            )
+        } else {
+            seal_digest(&self.root, self.first_sequence, self.count)
+        }
+    }
+}
+
+/// Verify a sealed segment's signature (version-dispatched: unchained
+/// seals verify under the legacy preimage, chained seals under the
+/// prev-binding preimage). Unknown versions fail.
 #[must_use]
 pub fn verify_seal<G: SegmentSealSigner>(segment: &SealedSegment, signer: &G) -> bool {
-    let digest = seal_digest(&segment.root, segment.first_sequence, segment.count);
-    signer.verify_root(&digest, &segment.signature)
+    if segment.version != SEAL_VERSION_UNCHAINED && segment.version != SEAL_VERSION_CHAINED {
+        return false;
+    }
+    signer.verify_root(&segment.digest(), &segment.signature)
+}
+
+/// Errors from chained-seal sequence verification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SealChainError {
+    /// The seal slice is empty.
+    Empty,
+    /// The seal at `index` is not a chained ([`SEAL_VERSION_CHAINED`])
+    /// seal; unchained seals carry no ordering evidence.
+    UnsupportedVersion {
+        /// Position of the offending seal in the slice.
+        index: usize,
+        /// The version found.
+        version: u8,
+    },
+    /// The seal at `index` does not bind the digest of its predecessor
+    /// (or the expected start value for index 0): splice, reorder,
+    /// omission, or cross-log transplant.
+    BrokenBinding {
+        /// Position of the offending seal in the slice.
+        index: usize,
+    },
+    /// The seal at `index` covers sequence numbers that overlap or
+    /// precede its predecessor's range.
+    SequenceRegression {
+        /// Position of the offending seal in the slice.
+        index: usize,
+    },
+    /// The seal at `index` failed signature verification.
+    BadSignature {
+        /// Position of the offending seal in the slice.
+        index: usize,
+    },
+}
+
+impl core::fmt::Display for SealChainError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Empty => write!(f, "empty seal chain"),
+            Self::UnsupportedVersion { index, version } => {
+                write!(f, "seal {index}: unsupported version {version}")
+            }
+            Self::BrokenBinding { index } => write!(f, "seal {index}: broken prev binding"),
+            Self::SequenceRegression { index } => write!(f, "seal {index}: sequence regression"),
+            Self::BadSignature { index } => write!(f, "seal {index}: bad signature"),
+        }
+    }
+}
+
+/// Keyless structural verification of a chained seal sequence starting
+/// from the [`seal_chain_genesis`] constant (i.e. the full history of
+/// one log). See [`verify_seal_chain_binding_from`].
+///
+/// # Errors
+///
+/// See [`verify_seal_chain_binding_from`].
+pub fn verify_seal_chain_binding(seals: &[SealedSegment]) -> Result<usize, SealChainError> {
+    verify_seal_chain_binding_from(seals, &seal_chain_genesis())
+}
+
+/// Keyless structural verification of a chained seal sequence: checks
+/// that every seal binds the recomputed digest of its predecessor
+/// (`seals[0]` must bind `expected_prev`) and that sequence ranges
+/// never regress. Detects splice (replacement), reorder, omission, and
+/// cross-log transplant between any two seals — **without any key**,
+/// because seal digests are computed from public fields only.
+///
+/// Signatures are *not* checked here; pair with [`verify_seal_chain`]
+/// (or per-seal [`verify_seal`] under a public-key
+/// [`SegmentSealSigner`]) to also authenticate each seal.
+///
+/// # Errors
+///
+/// [`SealChainError::Empty`] for an empty slice;
+/// [`SealChainError::UnsupportedVersion`] for a non-chained seal;
+/// [`SealChainError::BrokenBinding`] on a prev-digest mismatch;
+/// [`SealChainError::SequenceRegression`] on overlapping ranges.
+pub fn verify_seal_chain_binding_from(
+    seals: &[SealedSegment],
+    expected_prev: &[u8; 32],
+) -> Result<usize, SealChainError> {
+    if seals.is_empty() {
+        return Err(SealChainError::Empty);
+    }
+    let mut prev_digest = *expected_prev;
+    let mut next_min_sequence = 0u64;
+    for (index, seal) in seals.iter().enumerate() {
+        if seal.version != SEAL_VERSION_CHAINED {
+            return Err(SealChainError::UnsupportedVersion {
+                index,
+                version: seal.version,
+            });
+        }
+        if seal.prev_seal_digest != prev_digest {
+            return Err(SealChainError::BrokenBinding { index });
+        }
+        if seal.first_sequence < next_min_sequence {
+            return Err(SealChainError::SequenceRegression { index });
+        }
+        next_min_sequence = seal.first_sequence + u64::from(seal.count);
+        prev_digest = seal.digest();
+    }
+    Ok(seals.len())
+}
+
+/// Verify a chained seal sequence starting from [`seal_chain_genesis`]:
+/// structural binding ([`verify_seal_chain_binding`]) **and** each
+/// seal's signature.
+///
+/// # Errors
+///
+/// See [`verify_seal_chain_from`].
+pub fn verify_seal_chain<G: SegmentSealSigner>(
+    seals: &[SealedSegment],
+    signer: &G,
+) -> Result<usize, SealChainError> {
+    verify_seal_chain_from(seals, signer, &seal_chain_genesis())
+}
+
+/// Verify a chained seal sequence from an arbitrary start digest:
+/// checks every seal's signature and the prev-binding across the
+/// slice, detecting splice, replacement, reorder, and omission between
+/// any two seals. `expected_prev` is [`seal_chain_genesis`] for a full
+/// history, or the digest of the last already-verified seal when
+/// verifying an incremental suffix.
+///
+/// # Errors
+///
+/// All of [`verify_seal_chain_binding_from`]'s errors, plus
+/// [`SealChainError::BadSignature`] for a seal whose signature fails.
+pub fn verify_seal_chain_from<G: SegmentSealSigner>(
+    seals: &[SealedSegment],
+    signer: &G,
+    expected_prev: &[u8; 32],
+) -> Result<usize, SealChainError> {
+    verify_seal_chain_binding_from(seals, expected_prev)?;
+    for (index, seal) in seals.iter().enumerate() {
+        if !signer.verify_root(&seal.digest(), &seal.signature) {
+            return Err(SealChainError::BadSignature { index });
+        }
+    }
+    Ok(seals.len())
 }
 
 /// Merkle inclusion proof for a single record in a sealed segment.
@@ -352,8 +579,14 @@ impl<const S: usize> SegmentAccumulator<S> {
         Some(self.leaves[offset])
     }
 
-    /// Seal this segment: compute the root and sign
-    /// [`seal_digest`]`(root, first_sequence, len)`.
+    /// Seal this segment without cross-segment binding: compute the
+    /// root and sign [`seal_digest`]`(root, first_sequence, len)`,
+    /// producing a [`SEAL_VERSION_UNCHAINED`] seal.
+    ///
+    /// Standalone use only; prefer [`Self::seal_chained`] (or
+    /// [`crate::WitnessLogV2::seal_segment`], which chains
+    /// automatically) so the seal participates in publicly verifiable
+    /// history ordering.
     ///
     /// Returns `None` if the segment is empty.
     #[must_use]
@@ -363,9 +596,40 @@ impl<const S: usize> SegmentAccumulator<S> {
         let count = self.len as u32;
         let digest = seal_digest(&root, self.first_sequence, count);
         Some(SealedSegment {
+            version: SEAL_VERSION_UNCHAINED,
             root,
             first_sequence: self.first_sequence,
             count,
+            prev_seal_digest: [0u8; 32],
+            signature: signer.sign_root(&digest),
+        })
+    }
+
+    /// Seal this segment bound to its predecessor: compute the root and
+    /// sign [`seal_digest_chained`]`(root, first_sequence, len,
+    /// prev_seal_digest)`, producing a [`SEAL_VERSION_CHAINED`] seal.
+    ///
+    /// `prev_seal_digest` is the [`SealedSegment::digest`] of the
+    /// previous seal, or [`seal_chain_genesis`] for the first segment
+    /// of a log. Verify whole sequences with [`verify_seal_chain`].
+    ///
+    /// Returns `None` if the segment is empty.
+    #[must_use]
+    pub fn seal_chained<G: SegmentSealSigner>(
+        &self,
+        signer: &G,
+        prev_seal_digest: &[u8; 32],
+    ) -> Option<SealedSegment> {
+        let root = self.compute_root()?;
+        #[allow(clippy::cast_possible_truncation)]
+        let count = self.len as u32;
+        let digest = seal_digest_chained(&root, self.first_sequence, count, prev_seal_digest);
+        Some(SealedSegment {
+            version: SEAL_VERSION_CHAINED,
+            root,
+            first_sequence: self.first_sequence,
+            count,
+            prev_seal_digest: *prev_seal_digest,
             signature: signer.sign_root(&digest),
         })
     }
@@ -520,5 +784,233 @@ mod tests {
         assert!(acc.is_full());
         assert!(!acc.push([9u8; 16]));
         assert_eq!(acc.len(), 4);
+    }
+
+    // ---- R1: chained seals and seal-chain verification ----------------
+
+    /// Accumulator with `salt`-dependent leaf content so two "logs"
+    /// produce distinct roots for the same sequence ranges.
+    fn salted_acc<const S: usize>(n: usize, first_seq: u64, salt: u8) -> SegmentAccumulator<S> {
+        let mut acc = SegmentAccumulator::<S>::new(first_seq);
+        for i in 0..n {
+            let mut mac = [salt; 16];
+            mac[0] = u8::try_from(i).unwrap();
+            assert!(acc.push(mac));
+        }
+        acc
+    }
+
+    /// Three consecutive chained seals (segments 0..8, 8..16, 16..24).
+    fn build_chain3(signer: &Blake3SealSigner, salt: u8) -> [SealedSegment; 3] {
+        let s0 = salted_acc::<8>(8, 0, salt)
+            .seal_chained(signer, &seal_chain_genesis())
+            .unwrap();
+        let s1 = salted_acc::<8>(8, 8, salt)
+            .seal_chained(signer, &s0.digest())
+            .unwrap();
+        let s2 = salted_acc::<8>(8, 16, salt)
+            .seal_chained(signer, &s1.digest())
+            .unwrap();
+        [s0, s1, s2]
+    }
+
+    #[test]
+    fn chained_seal_round_trip_and_tamper() {
+        let signer = test_signer();
+        let sealed = filled_acc::<8>(5, 10)
+            .seal_chained(&signer, &seal_chain_genesis())
+            .unwrap();
+        assert_eq!(sealed.version, SEAL_VERSION_CHAINED);
+        assert!(verify_seal(&sealed, &signer));
+
+        let mut bad = sealed;
+        bad.root[0] ^= 1;
+        assert!(!verify_seal(&bad, &signer));
+
+        let mut bad = sealed;
+        bad.prev_seal_digest[0] ^= 1; // prev binding is signed
+        assert!(!verify_seal(&bad, &signer));
+
+        let mut bad = sealed;
+        bad.first_sequence += 1;
+        assert!(!verify_seal(&bad, &signer));
+
+        // Version relabeling cannot move a signature between preimages.
+        let mut bad = sealed;
+        bad.version = SEAL_VERSION_UNCHAINED;
+        assert!(!verify_seal(&bad, &signer));
+        let mut bad = filled_acc::<8>(5, 10).seal(&signer).unwrap();
+        bad.version = SEAL_VERSION_CHAINED;
+        assert!(!verify_seal(&bad, &signer));
+        let mut bad = sealed;
+        bad.version = 9; // unknown version
+        assert!(!verify_seal(&bad, &signer));
+    }
+
+    #[test]
+    fn unchained_seal_still_verifies_under_old_rules() {
+        let signer = test_signer();
+        let sealed = filled_acc::<8>(7, 10).seal(&signer).unwrap();
+        assert_eq!(sealed.version, SEAL_VERSION_UNCHAINED);
+        assert_eq!(sealed.prev_seal_digest, [0u8; 32]);
+        assert_eq!(
+            sealed.digest(),
+            seal_digest(&sealed.root, sealed.first_sequence, sealed.count)
+        );
+        assert!(verify_seal(&sealed, &signer));
+    }
+
+    #[test]
+    fn seal_chain_accepts_honest_sequence() {
+        let signer = test_signer();
+        let seals = build_chain3(&signer, 0xC3);
+        assert_eq!(verify_seal_chain(&seals, &signer), Ok(3));
+        // Structural binding alone needs no key at all.
+        assert_eq!(verify_seal_chain_binding(&seals), Ok(3));
+        // A single seal chains from genesis.
+        assert_eq!(verify_seal_chain(&seals[..1], &signer), Ok(1));
+    }
+
+    #[test]
+    fn seal_chain_detects_middle_replacement() {
+        // Replace the middle seal with a *valid* seal over different
+        // content, correctly bound to s0: the successor's binding
+        // exposes the splice.
+        let signer = test_signer();
+        let mut seals = build_chain3(&signer, 0xC3);
+        let forged = salted_acc::<8>(8, 8, 0xEE)
+            .seal_chained(&signer, &seals[0].digest())
+            .unwrap();
+        assert!(verify_seal(&forged, &signer)); // individually valid
+        seals[1] = forged;
+        assert_eq!(
+            verify_seal_chain(&seals, &signer),
+            Err(SealChainError::BrokenBinding { index: 2 })
+        );
+    }
+
+    #[test]
+    fn seal_chain_detects_reorder() {
+        let signer = test_signer();
+        let mut seals = build_chain3(&signer, 0xC3);
+        seals.swap(0, 1);
+        assert_eq!(
+            verify_seal_chain(&seals, &signer),
+            Err(SealChainError::BrokenBinding { index: 0 })
+        );
+        let mut seals = build_chain3(&signer, 0xC3);
+        seals.swap(1, 2);
+        assert_eq!(
+            verify_seal_chain(&seals, &signer),
+            Err(SealChainError::BrokenBinding { index: 1 })
+        );
+    }
+
+    #[test]
+    fn seal_chain_detects_omission() {
+        let signer = test_signer();
+        let seals = build_chain3(&signer, 0xC3);
+        let gapped = [seals[0], seals[2]];
+        assert_eq!(
+            verify_seal_chain(&gapped, &signer),
+            Err(SealChainError::BrokenBinding { index: 1 })
+        );
+        // Dropping the genesis seal is equally visible.
+        assert_eq!(
+            verify_seal_chain(&seals[1..], &signer),
+            Err(SealChainError::BrokenBinding { index: 0 })
+        );
+    }
+
+    #[test]
+    fn seal_chain_detects_cross_log_transplant() {
+        let signer = test_signer();
+        let mut seals = build_chain3(&signer, 0xC3);
+        let other = build_chain3(&signer, 0x5A); // same ranges, other log
+        seals[1] = other[1];
+        assert_eq!(
+            verify_seal_chain(&seals, &signer),
+            Err(SealChainError::BrokenBinding { index: 1 })
+        );
+    }
+
+    #[test]
+    fn seal_chain_genesis_handling() {
+        let signer = test_signer();
+        let seals = build_chain3(&signer, 0xC3);
+
+        // A first seal bound to something other than the genesis
+        // constant is rejected when verifying a full history.
+        let rogue = salted_acc::<8>(8, 0, 0xC3)
+            .seal_chained(&signer, &[0u8; 32])
+            .unwrap();
+        let mut bad = seals;
+        bad[0] = rogue;
+        assert_eq!(
+            verify_seal_chain(&bad, &signer),
+            Err(SealChainError::BrokenBinding { index: 0 })
+        );
+
+        // Incremental suffix verification from a trusted prior digest.
+        assert_eq!(
+            verify_seal_chain_from(&seals[1..], &signer, &seals[0].digest()),
+            Ok(2)
+        );
+    }
+
+    #[test]
+    fn seal_chain_rejects_unchained_versions() {
+        let signer = test_signer();
+        let mut seals = build_chain3(&signer, 0xC3);
+        seals[1] = salted_acc::<8>(8, 8, 0xC3).seal(&signer).unwrap();
+        assert_eq!(
+            verify_seal_chain(&seals, &signer),
+            Err(SealChainError::UnsupportedVersion {
+                index: 1,
+                version: SEAL_VERSION_UNCHAINED
+            })
+        );
+    }
+
+    #[test]
+    fn seal_chain_detects_bad_signature() {
+        let signer = test_signer();
+        let mut seals = build_chain3(&signer, 0xC3);
+        seals[1].signature[7] ^= 0x40;
+        assert_eq!(
+            verify_seal_chain(&seals, &signer),
+            Err(SealChainError::BadSignature { index: 1 })
+        );
+        // Wrong signer key fails every seal.
+        let seals = build_chain3(&signer, 0xC3);
+        assert_eq!(
+            verify_seal_chain(&seals, &Blake3SealSigner::new([0x43u8; 32])),
+            Err(SealChainError::BadSignature { index: 0 })
+        );
+    }
+
+    #[test]
+    fn seal_chain_detects_sequence_regression() {
+        let signer = test_signer();
+        let s0 = salted_acc::<8>(8, 0, 0xC3)
+            .seal_chained(&signer, &seal_chain_genesis())
+            .unwrap();
+        // Overlapping range (4..12 after 0..8), correctly bound.
+        let s1 = salted_acc::<8>(8, 4, 0xC3)
+            .seal_chained(&signer, &s0.digest())
+            .unwrap();
+        assert_eq!(
+            verify_seal_chain(&[s0, s1], &signer),
+            Err(SealChainError::SequenceRegression { index: 1 })
+        );
+    }
+
+    #[test]
+    fn seal_chain_empty_rejected() {
+        let signer = test_signer();
+        assert_eq!(
+            verify_seal_chain(&[], &signer),
+            Err(SealChainError::Empty)
+        );
     }
 }

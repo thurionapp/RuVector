@@ -74,15 +74,20 @@ pub use replay::{
     query_by_time_range,
 };
 pub use seal::{
-    Blake3SealSigner, MerkleProof, SealedSegment, SegmentAccumulator, SegmentSealSigner,
-    seal_digest, verify_inclusion, verify_seal, DEFAULT_SEGMENT_SIZE, MAX_MERKLE_DEPTH,
+    Blake3SealSigner, MerkleProof, SealChainError, SealedSegment, SegmentAccumulator,
+    SegmentSealSigner, seal_chain_genesis, seal_digest, seal_digest_chained, verify_inclusion,
+    verify_seal, verify_seal_chain, verify_seal_chain_binding, verify_seal_chain_binding_from,
+    verify_seal_chain_from, DEFAULT_SEGMENT_SIZE, MAX_MERKLE_DEPTH, SEAL_VERSION_CHAINED,
+    SEAL_VERSION_UNCHAINED,
 };
 pub use v2::{
-    CHAIN_KEY_CONTEXT, WitnessLogV2, compute_chain_mac_v2, default_chain_key, derive_chain_key,
+    CHAIN_KEY_CONTEXT, CoverageError, CoveragePolicy, RATCHET_CONTEXT, WitnessLogV2,
+    compute_chain_mac_v2, default_chain_key, derive_chain_key, erase_key, ratchet_chain_key,
 };
 pub use versioned::{
     ChainIntegrityErrorV2, LogVerifyError, LogVerifySummary, v1_head_to_genesis,
-    verify_chain_v1_with_head, verify_chain_v2, verify_chain_v2_from, verify_log_bytes,
+    verify_chain_v1_with_head, verify_chain_v2, verify_chain_v2_from,
+    verify_chain_v2_ratcheted, verify_log_bytes,
 };
 #[cfg(any(test, feature = "null-signer"))]
 #[allow(deprecated)]
