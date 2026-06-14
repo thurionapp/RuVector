@@ -241,6 +241,8 @@ members = [
     # Calculus of emergent / relational time (Wheeler-DeWitt, Page-Wootters,
     # entropic, thermal) + Structural Proper Time for agentic systems.
     "crates/emergent-time",
+    # Coherence-weighted agent memory compaction (ADR-252, nightly 2026-06-14)
+    "crates/ruvector-agent-memory",
 ]
 resolver = "2"
 
