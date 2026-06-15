@@ -398,3 +398,29 @@ pub async fn train_router(
     .map_err(|e| Error::from_reason(format!("Task failed: {}", e)))?
     .map_err(Error::from_reason)
 }
+
+/// Score a query embedding with a trained FastGRNN model (raw forward pass).
+///
+/// Loads the `.safetensors` produced by {@link train_router} and runs the model
+/// directly on `embedding` (which must match the model's `input_dim`). Returns
+/// the sigmoid output in 0..1 — high means "the cheap model is good enough"
+/// (route to the cheaper model); low means route to a stronger model.
+///
+/// This is the inference path that matches `trainRouter` (trained on raw
+/// embeddings); it does not run `Router`'s feature engineering.
+#[napi]
+pub async fn score(model_path: String, embedding: Vec<f64>) -> Result<f64> {
+    use ruvector_tiny_dancer_core::model::FastGRNN;
+
+    tokio::task::spawn_blocking(move || -> std::result::Result<f64, String> {
+        let model = FastGRNN::load(&model_path).map_err(|e| format!("load: {e}"))?;
+        let feats: Vec<f32> = embedding.into_iter().map(|v| v as f32).collect();
+        let s = model
+            .forward(&feats, None)
+            .map_err(|e| format!("forward: {e}"))?;
+        Ok(s as f64)
+    })
+    .await
+    .map_err(|e| Error::from_reason(format!("Task failed: {}", e)))?
+    .map_err(Error::from_reason)
+}

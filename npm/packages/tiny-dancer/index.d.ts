@@ -191,3 +191,20 @@ export function trainRouter(
   prices: Record<string, number>,
   options: TrainRouterOptions
 ): Promise<TrainRouterResult>;
+
+/**
+ * Score a query embedding with a trained FastGRNN model (raw forward pass).
+ *
+ * Loads the `.safetensors` produced by {@link trainRouter} and runs the model
+ * directly on `embedding` (which must match the model's `inputDim`). Returns the
+ * sigmoid output in 0..1 — high means "the cheap model is good enough" (route to
+ * the cheaper model); low means route to a stronger model. This is the inference
+ * path that matches `trainRouter`; it does not run `Router`'s feature engineering.
+ *
+ * @example
+ * ```javascript
+ * const s = await score('./router.safetensors', queryEmbedding);
+ * const useCheap = s >= 0.5;
+ * ```
+ */
+export function score(modelPath: string, embedding: number[]): Promise<number>;
