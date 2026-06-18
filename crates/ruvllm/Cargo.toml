@@ -62,13 +62,16 @@ futures-core = "0.3"
 tokio-stream = { version = "0.1", optional = true }
 
 # Candle ML framework (optional)
-candle-core = { version = "0.8", optional = true }
-candle-nn = { version = "0.8", optional = true }
-candle-transformers = { version = "0.8", optional = true }
+# 0.9.x: uses cudarc 0.19 which supports CUDA 13.0 natively (no CUDA_HOME
+# workaround needed on RTX 5080 / SM 12.0 machines).
+candle-core = { version = "0.9", optional = true }
+candle-nn = { version = "0.9", optional = true }
+candle-transformers = { version = "0.9", optional = true }
 
 # Direct cudarc access for fused CUDA kernels (fused-act feature).
-# Must match the version candle-core resolves to (0.13.x) to share
-# the same device context.
+# Pinned to 0.13 — act_kernel.rs uses the 0.13 tuple-based launch API.
+# cudarc 0.13 and 0.19 can coexist: each manages its own device context
+# (the staging-buffer path never shares types with candle's cudarc 0.19).
 cudarc = { version = "0.13", optional = true, default-features = false, features = ["nvrtc", "driver", "std"] }
 
 # Tokenizers
