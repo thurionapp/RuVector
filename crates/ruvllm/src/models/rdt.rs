@@ -771,8 +771,10 @@ mod candle_impl {
                 return Err(RuvLLMError::Generation("empty prompt".into()));
             }
             let mut cache = RdtCache::new();
-            let prompt = Tensor::from_vec(prompt_ids.to_vec(), (1, prompt_ids.len()), &self.device)
-                .map_err(cand)?;
+            // Use from_slice to avoid a to_vec() copy on the prompt.
+            let prompt =
+                Tensor::from_slice(prompt_ids, (1, prompt_ids.len()), &self.device)
+                    .map_err(cand)?;
             let logits = self.forward_cached(&prompt, &mut cache)?;
             let mut next = last_argmax(&logits)?;
 
@@ -782,7 +784,9 @@ mod candle_impl {
                 if Some(next) == eos {
                     break;
                 }
-                let step = Tensor::from_vec(vec![next], (1, 1), &self.device).map_err(cand)?;
+                // from_slice on a stack array avoids heap allocation per decode step.
+                let step =
+                    Tensor::from_slice(&[next], (1, 1), &self.device).map_err(cand)?;
                 let logits = self.forward_cached(&step, &mut cache)?;
                 next = last_argmax(&logits)?;
             }

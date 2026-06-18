@@ -321,8 +321,9 @@ impl OpenMythos {
         }
         let mut cache = MythosCache::new(&self.cfg);
 
-        let prompt = Tensor::from_vec(prompt_ids.to_vec(), (1, prompt_ids.len()), &self.device)
-            .map_err(cand)?;
+        let prompt =
+            Tensor::from_slice(prompt_ids, (1, prompt_ids.len()), &self.device)
+                .map_err(cand)?;
         let logits = self.forward_cached(&prompt, &mut cache, n_loops)?;
         let mut next = self.last_argmax(&logits)?;
 
@@ -332,7 +333,7 @@ impl OpenMythos {
             if Some(next) == eos {
                 break;
             }
-            let step = Tensor::from_vec(vec![next], (1, 1), &self.device).map_err(cand)?;
+            let step = Tensor::from_slice(&[next], (1, 1), &self.device).map_err(cand)?;
             let logits = self.forward_cached(&step, &mut cache, n_loops)?;
             next = self.last_argmax(&logits)?;
         }
@@ -357,8 +358,9 @@ impl OpenMythos {
         let mut cache = MythosCache::new(&self.cfg);
         let mut history: Vec<u32> = prompt_ids.to_vec();
 
-        let prompt = Tensor::from_vec(prompt_ids.to_vec(), (1, prompt_ids.len()), &self.device)
-            .map_err(cand)?;
+        let prompt =
+            Tensor::from_slice(prompt_ids, (1, prompt_ids.len()), &self.device)
+                .map_err(cand)?;
         let logits = self.forward_cached(&prompt, &mut cache, n_loops)?;
         let mut next = sampler.sample(&self.last_logits(&logits)?, &history);
 
@@ -369,7 +371,7 @@ impl OpenMythos {
             if Some(next) == eos {
                 break;
             }
-            let step = Tensor::from_vec(vec![next], (1, 1), &self.device).map_err(cand)?;
+            let step = Tensor::from_slice(&[next], (1, 1), &self.device).map_err(cand)?;
             let logits = self.forward_cached(&step, &mut cache, n_loops)?;
             next = sampler.sample(&self.last_logits(&logits)?, &history);
         }
@@ -382,7 +384,7 @@ impl OpenMythos {
         if ids.is_empty() {
             return Err(RuvLLMError::Generation("empty input".into()));
         }
-        let t = Tensor::from_vec(ids.to_vec(), (1, ids.len()), &self.device).map_err(cand)?;
+        let t = Tensor::from_slice(ids, (1, ids.len()), &self.device).map_err(cand)?;
         let x = self
             .embed
             .forward(&t)

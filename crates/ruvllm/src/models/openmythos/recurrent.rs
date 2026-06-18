@@ -222,6 +222,18 @@ impl RecurrentBlock {
         let mut depth_f32 = Tensor::zeros((b, seq, 1), DType::F32, &device).map_err(cand)?;
         let ones_f32 = Tensor::ones((b, seq, 1), DType::F32, &device).map_err(cand)?;
 
+        // Precompute step tensors (t+1) for depth tracking — avoids Tensor::new per iteration.
+        let step_tensors: Vec<Tensor> = (0..n_loops)
+            .map(|t| {
+                Tensor::new((t + 1) as f32, &device)
+                    .map_err(cand)?
+                    .broadcast_as((b, seq, 1))
+                    .map_err(cand)?
+                    .to_dtype(DType::F32)
+                    .map_err(cand)
+            })
+            .collect::<Result<Vec<_>>>()?;
+
         // KV cache: the final iteration's KV wins (see original design note).
         let mut last_kv: Option<KvLayerCache> = None;
         let mut final_t = 0usize;
@@ -278,17 +290,10 @@ impl RecurrentBlock {
             cum_f32 = (&cum_f32 + &(&still_running * &p_eff).map_err(cand)?).map_err(cand)?;
             not_halted_f32 = (&not_halted_f32 - &will_halt).map_err(cand)?;
 
-            // Record per-token halt iteration for telemetry (on-device, no transfer).
-            // depth_f32[i] = t+1 when the token halts, else keeps the previous value (0
-            // until halted, then frozen). Uses: d = d + will_halt * ((t+1) - d).
-            let step_f32 = Tensor::new((t + 1) as f64, &device)
-                .map_err(cand)?
-                .broadcast_as((b, seq, 1))
-                .map_err(cand)?
-                .to_dtype(DType::F32)
-                .map_err(cand)?;
+            // Record per-token halt iteration using the precomputed step tensor.
+            let step_f32 = &step_tensors[t];
             depth_f32 = (&depth_f32
-                + &(&will_halt * &(&step_f32 - &depth_f32).map_err(cand)?).map_err(cand)?)
+                + &(&will_halt * &(step_f32 - &depth_f32).map_err(cand)?).map_err(cand)?)
                 .map_err(cand)?;
 
             final_t = t + 1;
