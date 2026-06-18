@@ -455,23 +455,17 @@ impl OpenMythos {
     }
 
     /// Argmax over the vocabulary at the last sequence position of `[1, seq, vocab]`.
+    ///
+    /// Uses `Tensor::argmax` on-device to avoid transferring the full vocab
+    /// (vocab_size × 4 bytes ≈ 128 KB for vocab=32000) to CPU — only the
+    /// winning index (4 bytes) is transferred via `to_scalar`.
     fn last_argmax(&self, logits: &Tensor) -> Result<u32> {
         let (_b, seq, _v) = logits.dims3().map_err(cand)?;
         let last = logits.i((0, seq - 1)).map_err(cand)?; // [vocab]
-        let row: Vec<f32> = last
-            .to_dtype(DType::F32)
+        last.argmax(candle_core::D::Minus1)
             .map_err(cand)?
-            .to_vec1()
-            .map_err(cand)?;
-        let mut best = 0usize;
-        let mut best_v = f32::NEG_INFINITY;
-        for (i, &v) in row.iter().enumerate() {
-            if v > best_v {
-                best_v = v;
-                best = i;
-            }
-        }
-        Ok(best as u32)
+            .to_scalar::<u32>()
+            .map_err(cand)
     }
 }
 

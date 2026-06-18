@@ -906,23 +906,16 @@ mod candle_impl {
     }
 
     /// Argmax over vocab at the last sequence position of `[1, seq, vocab]`.
+    ///
+    /// `Tensor::argmax` runs on-device; only the winning index (4 bytes) is
+    /// transferred vs the full vocab row (~128 KB for vocab=32000).
     fn last_argmax(logits: &Tensor) -> Result<u32> {
         let (_b, seq, _v) = logits.dims3().map_err(cand)?;
-        let last = logits.i((0, seq - 1)).map_err(cand)?;
-        let row: Vec<f32> = last
-            .to_dtype(DType::F32)
+        let last = logits.i((0, seq - 1)).map_err(cand)?; // [vocab]
+        last.argmax(D::Minus1)
             .map_err(cand)?
-            .to_vec1()
-            .map_err(cand)?;
-        let mut best = 0usize;
-        let mut best_v = f32::NEG_INFINITY;
-        for (i, &v) in row.iter().enumerate() {
-            if v > best_v {
-                best_v = v;
-                best = i;
-            }
-        }
-        Ok(best as u32)
+            .to_scalar::<u32>()
+            .map_err(cand)
     }
 
     /// Apply rotary position embeddings to `[b, n, seq, head_dim]`.
