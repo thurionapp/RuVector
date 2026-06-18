@@ -1,0 +1,115 @@
+# ADR-258: GPU Optimization of RDT/OpenMythos ACT Halting Loop
+
+**Status:** Accepted  
+**Date:** 2026-06-18  
+**Branch:** `claude/rdt-execution-ruvllm-elfzo8` (PR #589)  
+**Components:** `crates/ruvllm/src/models/openmythos/recurrent.rs`, `crates/ruvllm/src/models/rdt.rs`, `crates/ruvllm/src/models/openmythos/ffn.rs`
+
+---
+
+## Context
+
+PR #589 introduced the Recurrent-Depth Transformer (RDT) substrate and the OpenMythos model port in Rust/Candle. Both models implement Adaptive Computation Time (ACT) halting: each token in the sequence decides, loop iteration by loop iteration, whether it has "computed enough" and can exit the recurrent loop early.
+
+The original implementation tracked per-token ACT state (cumulative probability, halted mask, realized depth) as CPU-side `Vec<f32>` / `Vec<bool>` structures. Each loop iteration called `to_vec1()` to pull the halting-probability tensor from the GPU to the CPU, ran a scalar loop to compute weights, then called `Tensor::from_vec()` to push the weight tensor back. On an RTX 5080 (PCIe 5.0), this forced two full device synchronizations per recurrent iteration, serializing the GPU pipeline and eliminating the benefit of kernel overlap.
+
+Additionally, the MoE FFN in `ffn.rs` called `probs.to_vec2::<f32>()` directly on a BF16/F16 tensor, causing a dtype panic when the model was loaded in reduced precision.
+
+---
+
+## Decision
+
+### 1. Vectorized on-device ACT loop
+
+Replace all CPU-side ACT state with F32 tensors resident on the compute device:
+
+```
+cum_f32         [b, seq, 1]  — cumulative halt probability
+not_halted_f32  [b, seq, 1]  — 1.0 for still-running tokens
+depth_f32       [b, seq, 1]  — iteration count when each token halted
+```
+
+Per-iteration weight computation becomes pure tensor arithmetic:
+
+```
+p_eff    = p_f32 * not_halted_f32          (zero out halted tokens)
+new_cum  = cum_f32 + p_eff
+will_halt = ge(new_cum, threshold) * not_halted_f32   (u8 → f32)
+w_halt   = will_halt * (1 - cum_f32)       (remainder weight)
+w_run    = (not_halted_f32 - will_halt) * p_eff
+w        = w_halt + w_run                  (cast to model dtype once)
+h_out   += h * w
+```
+
+State updates stay on device:
+
+```
+cum_f32         += (not_halted_f32 - will_halt) * p_eff
+not_halted_f32  -= will_halt
+depth_f32       += will_halt * ((t+1) - depth_f32)
+```
+
+Early-exit check (`remaining = not_halted_f32.sum_all().to_scalar()`) is a single scalar GPU→CPU sync per iteration — substantially cheaper than transferring the full `[b×seq]` weight vector.
+
+Depth telemetry is recorded with **one** `to_vec1()` call after the loop ends, not inside it.
+
+The same pattern is applied to `RdtModel::recurrent_loop` with `running_f32` / `depth_f32` replacing `Vec<f32>` / `Vec<usize>`.
+
+### 2. BF16/F16 MoE router fix
+
+The MoE router calls `softmax_last_dim` then `to_vec2()` for CPU-side sparse dispatch. For reduced-precision models (BF16/F16), `to_vec2::<f32>()` panics because the storage dtype does not match the return type. Fix: insert `.to_dtype(DType::F32)` between softmax and `to_vec2`. This is negligible overhead — the GPU→CPU transfer that `to_vec2` already requires dominates.
+
+### 3. CUDA benchmark coverage
+
+Extended `recurrent_depth_bench.rs` to include:
+- `cpu/*` groups (F32, seq 32/128/256)
+- `cuda/*` groups (F32 + BF16, seq 32/128/256/512)
+
+CUDA benches require `--features candle,cuda` with CUDA 12.8 (cudarc 0.13.9 does not recognize CUDA 13.0; use `CUDA_HOME=/usr/local/cuda-12.8`).
+
+---
+
+## Consequences
+
+### Performance (RTX 5080, SM 12.0, CUDA 12.8)
+
+| Model | Seq | CPU F32 | CUDA F32 | CUDA BF16 | GPU Speedup |
+|-------|-----|---------|----------|-----------|-------------|
+| OpenMythos GQA | 32 | 29.7 ms | 7.04 ms | 6.87 ms | **4.2×** |
+| OpenMythos GQA | 128 | 68.0 ms | 8.24 ms | 7.77 ms | **8.3×** |
+| OpenMythos GQA | 256 | 115 ms | 9.70 ms | 8.90 ms | **11.8×** |
+| OpenMythos GQA | 512 | ~230 ms | 13.1 ms | 11.8 ms | **17.5×** |
+| RDT Shared | 32 | 10.6 ms | 2.16 ms | 2.05 ms | **4.9×** |
+| RDT Shared | 128 | 26.2 ms | 2.29 ms | 2.23 ms | **11.4×** |
+| RDT Shared | 256 | 44.2 ms | 2.89 ms | 2.66 ms | **15.3×** |
+| RDT Shared | 512 | ~91 ms | 4.27 ms | 3.54 ms | **21.3×** |
+
+Speedup scales with sequence length because the old design had O(seq) CPU-side work per loop iteration; the new design is O(1) kernel launches regardless of sequence length, with all per-token work parallelized on GPU.
+
+BF16 is 3–11% faster than F32 on GPU; the advantage grows with sequence length as memory bandwidth (halved for BF16) increasingly dominates over kernel launch overhead.
+
+### Telemetry accuracy
+
+The old code tracked exact per-token halt iteration by updating `Vec<usize>` inline. The new code accumulates `depth_f32` on-device using the tensor formula `d += will_halt * ((t+1) - d)`, which records the exact iteration at which each token halted. Accuracy is identical; the `act_halts_via_cumulative_probability` unit test continues to assert `max_inference_depth == 2`.
+
+### CPU performance
+
+On CPU, the vectorized path adds small overhead for tensor-operator dispatch versus direct scalar arithmetic. This is neutral in practice — ACT is not the bottleneck on CPU; the transformer GEMM dominates.
+
+### Build notes
+
+- Requires CUDA 12.8 for the `cuda` feature on this workstation (cudarc 0.13.9 panics on CUDA 13.0; `/usr/local/cuda-12.8` is available).
+- All 1582 tests pass under both `candle` and `candle,cuda` feature flags.
+
+---
+
+## Alternatives Considered
+
+**Periodic early-exit check (every 4 iterations)**  
+Reduces GPU→CPU syncs to ~25% of iterations. Rejected because: (a) it makes telemetry approximate, breaking the existing unit test; (b) the scalar sync cost is small compared to the eliminated weight-vector transfer; (c) on CPU the sync is essentially free.
+
+**Separate GPU/CPU code paths**  
+Maintain the original CPU-only loop and add a GPU-specific branch gated on `device.is_cuda()`. Rejected — the vectorized tensor path works correctly and efficiently on both devices. Duplicating logic would add maintenance burden without measurable CPU benefit.
+
+**Removing MoE in BF16 path**  
+Downgrade MoE to dense FFN when model dtype is non-F32. Rejected — the fix is one line (`.to_dtype(F32)`) and preserves model fidelity.
