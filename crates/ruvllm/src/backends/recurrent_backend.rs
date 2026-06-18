@@ -231,40 +231,73 @@ impl LlmBackend for RecurrentBackend {
         prompt: &str,
         params: GenerateParams,
     ) -> Result<Box<dyn Iterator<Item = Result<GeneratedToken>> + Send + '_>> {
-        // Eager generation, surfaced as an iterator of decoded tokens.
         let tok = self
             .tokenizer
             .as_ref()
             .ok_or_else(|| RuvLLMError::Tokenization("no tokenizer loaded".into()))?;
+        let model = self
+            .model
+            .as_ref()
+            .ok_or_else(|| RuvLLMError::Model("no model loaded".into()))?;
         let ids = tok.encode(prompt)?;
-        let out = self.generate_token_ids(&ids, &params)?;
-        let mut items = Vec::with_capacity(out.len());
-        for id in out {
-            let text = tok.decode(&[id]).unwrap_or_default();
-            items.push(Ok(GeneratedToken {
-                id,
-                text,
-                logprob: None,
-                is_special: false,
-            }));
-        }
+        let mut items = Vec::with_capacity(params.max_tokens);
+
+        // True per-token streaming: yield each token immediately after sampling
+        // rather than buffering the full sequence.
+        model.generate_stream_sampled(
+            &ids,
+            params.max_tokens,
+            self.n_loops,
+            self.eos,
+            sampling_from(&params),
+            |id| {
+                let text = tok.decode(&[id]).unwrap_or_default();
+                items.push(Ok(GeneratedToken {
+                    id,
+                    text,
+                    logprob: None,
+                    is_special: false,
+                }));
+                true // continue
+            },
+        )?;
         Ok(Box::new(items.into_iter()))
     }
 
     fn generate_stream_v2(&self, prompt: &str, params: GenerateParams) -> Result<TokenStream> {
+        let tok = self
+            .tokenizer
+            .as_ref()
+            .ok_or_else(|| RuvLLMError::Tokenization("no tokenizer loaded".into()))?;
+        let model = self
+            .model
+            .as_ref()
+            .ok_or_else(|| RuvLLMError::Model("no model loaded".into()))?;
+        let ids = tok.encode(prompt)?;
         let (tx, stream) = TokenStream::channel();
         let start = std::time::Instant::now();
         let mut count = 0usize;
-        for ev in self.generate_stream(prompt, params)? {
-            match ev {
-                Ok(token) => {
-                    count += 1;
-                    let _ = tx.send(StreamEvent::Token(token));
-                }
-                Err(e) => {
-                    let _ = tx.send(StreamEvent::Error(e.to_string()));
-                }
-            }
+
+        let result = model.generate_stream_sampled(
+            &ids,
+            params.max_tokens,
+            self.n_loops,
+            self.eos,
+            sampling_from(&params),
+            |id| {
+                let text = tok.decode(&[id]).unwrap_or_default();
+                count += 1;
+                tx.send(StreamEvent::Token(GeneratedToken {
+                    id,
+                    text,
+                    logprob: None,
+                    is_special: false,
+                }))
+                .is_ok()
+            },
+        );
+        if let Err(e) = result {
+            let _ = tx.send(StreamEvent::Error(e.to_string()));
         }
         let ms = start.elapsed().as_millis() as u64;
         let tps = if ms > 0 {

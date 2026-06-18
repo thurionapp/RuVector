@@ -378,6 +378,49 @@ impl OpenMythos {
         Ok(out)
     }
 
+    /// Token-by-token streaming generation via callback.
+    ///
+    /// Invokes `on_token(id)` immediately after each token is sampled, before
+    /// the next decode step begins — giving the caller true per-token latency
+    /// rather than buffering the entire sequence. Returns early if `on_token`
+    /// returns `false` (caller signals stop).
+    pub fn generate_stream_sampled(
+        &self,
+        prompt_ids: &[u32],
+        max_new_tokens: usize,
+        n_loops: usize,
+        eos: Option<u32>,
+        sampling: SamplingConfig,
+        mut on_token: impl FnMut(u32) -> bool,
+    ) -> Result<()> {
+        if prompt_ids.is_empty() {
+            return Err(RuvLLMError::Generation("empty prompt".into()));
+        }
+        let mut sampler = Sampler::new(sampling);
+        let mut cache = MythosCache::new(&self.cfg);
+        let mut history: Vec<u32> = prompt_ids.to_vec();
+
+        let prompt =
+            Tensor::from_slice(prompt_ids, (1, prompt_ids.len()), &self.device)
+                .map_err(cand)?;
+        let logits = self.forward_cached(&prompt, &mut cache, n_loops)?;
+        let mut next = sampler.sample(&self.last_logits(&logits)?, &history);
+
+        for _ in 0..max_new_tokens {
+            if !on_token(next) {
+                break;
+            }
+            history.push(next);
+            if Some(next) == eos {
+                break;
+            }
+            let step = Tensor::from_slice(&[next], (1, 1), &self.device).map_err(cand)?;
+            let logits = self.forward_cached(&step, &mut cache, n_loops)?;
+            next = sampler.sample(&self.last_logits(&logits)?, &history);
+        }
+        Ok(())
+    }
+
     /// Mean-pooled token embedding `[dim]` for `ids` — a lightweight sentence
     /// embedding from the input embedding layer.
     pub fn embed_pooled(&self, ids: &[u32]) -> Result<Vec<f32>> {
