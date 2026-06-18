@@ -108,6 +108,13 @@ pub struct OpenMythos {
     cfg: MythosConfig,
     device: Device,
     dtype: DType,
+    /// Precomputed RoPE tables `[max_seq_len, rope_dim]` in model dtype.
+    /// Sliced via `narrow(0, offset, seq)` at runtime — no per-call recompute.
+    rope_cos: Tensor,
+    rope_sin: Tensor,
+    /// Precomputed lower-triangular additive causal mask `[max_seq_len, max_seq_len]`
+    /// in model dtype. Sliced via `narrow` at runtime.
+    causal_mask_cache: Tensor,
     /// Recurrent-depth telemetry.
     pub telemetry: DepthTelemetry,
 }
@@ -140,6 +147,18 @@ impl OpenMythos {
         let head =
             candle_nn::linear_no_bias(cfg.dim, cfg.vocab_size, vb.pp("head")).map_err(cand)?;
 
+        // Precompute RoPE tables for all positions up to max_seq_len.
+        // rope_dim differs by attention type (full head_dim for GQA, qk_rope_head_dim for MLA).
+        let rope_dim = match cfg.attn_type {
+            AttnType::Gqa => cfg.head_dim(),
+            AttnType::Mla => cfg.qk_rope_head_dim,
+        };
+        let (rope_cos, rope_sin) =
+            rope_tables(cfg.max_seq_len, 0, rope_dim, cfg.rope_theta, &device, dtype)?;
+
+        // Precompute full lower-triangular causal mask [max_seq_len, max_seq_len].
+        let causal_mask_cache = causal_mask(cfg.max_seq_len, cfg.max_seq_len, 0, &device, dtype)?;
+
         Ok(Self {
             embed,
             prelude,
@@ -150,6 +169,9 @@ impl OpenMythos {
             cfg,
             device,
             dtype,
+            rope_cos,
+            rope_sin,
+            causal_mask_cache,
             telemetry: DepthTelemetry::new(),
         })
     }
@@ -228,20 +250,22 @@ impl OpenMythos {
             .to_dtype(self.dtype)
             .map_err(cand)?;
 
-        // RoPE tables for the attention variant's rotary dimension.
-        let rope_dim = match self.cfg.attn_type {
-            AttnType::Gqa => self.cfg.head_dim(),
-            AttnType::Mla => self.cfg.qk_rope_head_dim,
-        };
-        let (cos, sin) = rope_tables(
-            seq,
-            offset,
-            rope_dim,
-            self.cfg.rope_theta,
-            &self.device,
-            self.dtype,
-        )?;
-        let mask = causal_mask(seq, offset + seq, offset, &self.device, self.dtype)?;
+        // Slice precomputed RoPE tables for positions offset..offset+seq.
+        let cos = self
+            .rope_cos
+            .narrow(0, offset, seq)
+            .map_err(cand)?;
+        let sin = self
+            .rope_sin
+            .narrow(0, offset, seq)
+            .map_err(cand)?;
+        // Slice precomputed causal mask: rows offset..offset+seq, cols 0..offset+seq.
+        let mask = self
+            .causal_mask_cache
+            .narrow(0, offset, seq)
+            .map_err(cand)?
+            .narrow(1, 0, offset + seq)
+            .map_err(cand)?;
 
         // Prelude.
         for (i, blk) in self.prelude.iter().enumerate() {

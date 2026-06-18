@@ -624,6 +624,12 @@ mod candle_impl {
         cfg: RdtConfig,
         device: Device,
         dtype: DType,
+        /// Precomputed RoPE tables `[max_position_embeddings, head_dim]` in model dtype.
+        rope_cos: Tensor,
+        rope_sin: Tensor,
+        /// Precomputed lower-triangular additive causal mask
+        /// `[max_position_embeddings, max_position_embeddings]` in model dtype.
+        causal_mask_cache: Tensor,
         /// Recurrent-depth telemetry (see [`DepthTelemetry`]).
         pub telemetry: DepthTelemetry,
     }
@@ -657,6 +663,42 @@ mod candle_impl {
                 candle_nn::linear_no_bias(cfg.hidden_size, cfg.vocab_size, vb.pp("lm_head"))
                     .map_err(cand)?;
 
+            // Precompute RoPE tables and causal mask for all positions up to
+            // max_position_embeddings — eliminates per-forward-pass from_vec + H2D upload.
+            let head_dim = cfg.head_dim();
+            let max_pos = cfg.max_position_embeddings;
+            let (rope_cos, rope_sin) = {
+                let half = head_dim / 2;
+                let theta = cfg.rope_theta as f64;
+                let inv_freq: Vec<f32> = (0..half)
+                    .map(|i| (1.0 / theta.powf(2.0 * i as f64 / head_dim as f64)) as f32)
+                    .collect();
+                let inv_freq =
+                    Tensor::from_vec(inv_freq, (1, half), &device).map_err(cand)?;
+                let positions: Vec<f32> = (0..max_pos).map(|p| p as f32).collect();
+                let positions =
+                    Tensor::from_vec(positions, (max_pos, 1), &device).map_err(cand)?;
+                let freqs = positions.matmul(&inv_freq).map_err(cand)?;
+                let freqs =
+                    Tensor::cat(&[&freqs, &freqs], D::Minus1).map_err(cand)?;
+                let cos = freqs.cos().map_err(cand)?.to_dtype(dtype).map_err(cand)?;
+                let sin = freqs.sin().map_err(cand)?.to_dtype(dtype).map_err(cand)?;
+                (cos, sin)
+            };
+            let causal_mask_cache = {
+                let n = max_pos;
+                let mut data = vec![0f32; n * n];
+                for i in 0..n {
+                    for j in (i + 1)..n {
+                        data[i * n + j] = f32::NEG_INFINITY;
+                    }
+                }
+                Tensor::from_vec(data, (n, n), &device)
+                    .map_err(cand)?
+                    .to_dtype(dtype)
+                    .map_err(cand)?
+            };
+
             Ok(Self {
                 embed_tokens,
                 shared_blocks,
@@ -666,6 +708,9 @@ mod candle_impl {
                 cfg,
                 device,
                 dtype,
+                rope_cos,
+                rope_sin,
+                causal_mask_cache,
                 telemetry: DepthTelemetry::new(),
             })
         }
@@ -694,8 +739,16 @@ mod candle_impl {
             let xs = self.embed_tokens.forward(input_ids).map_err(cand)?;
             let xs = xs.to_dtype(self.dtype).map_err(cand)?;
 
-            let (cos, sin) = self.rope_tables(seq, offset)?;
-            let mask = self.causal_mask(seq, offset + seq, offset)?;
+            // Slice precomputed RoPE tables for positions offset..offset+seq.
+            let cos = self.rope_cos.narrow(0, offset, seq).map_err(cand)?;
+            let sin = self.rope_sin.narrow(0, offset, seq).map_err(cand)?;
+            // Slice precomputed causal mask: rows offset..offset+seq, cols 0..offset+seq.
+            let mask = self
+                .causal_mask_cache
+                .narrow(0, offset, seq)
+                .map_err(cand)?
+                .narrow(1, 0, offset + seq)
+                .map_err(cand)?;
 
             let (hidden, kv) =
                 self.recurrent_loop(&xs, &cos, &sin, &mask, cache.kv.as_ref(), b, seq)?;
@@ -822,54 +875,6 @@ mod candle_impl {
             Ok((hidden, kv))
         }
 
-        /// RoPE cos/sin tables for `seq` positions at absolute offset
-        /// `offset..offset+seq`: `[seq, head_dim]`.
-        fn rope_tables(&self, seq: usize, offset: usize) -> Result<(Tensor, Tensor)> {
-            let head_dim = self.cfg.head_dim();
-            let half = head_dim / 2;
-            let theta = self.cfg.rope_theta as f64;
-
-            let inv_freq: Vec<f32> = (0..half)
-                .map(|i| (1.0 / theta.powf(2.0 * i as f64 / head_dim as f64)) as f32)
-                .collect();
-            let inv_freq = Tensor::from_vec(inv_freq, (1, half), &self.device).map_err(cand)?;
-            let positions: Vec<f32> = (0..seq).map(|p| (p + offset) as f32).collect();
-            let positions = Tensor::from_vec(positions, (seq, 1), &self.device).map_err(cand)?;
-
-            // [seq, half]
-            let freqs = positions.matmul(&inv_freq).map_err(cand)?;
-            // Duplicate to full head_dim: [seq, head_dim].
-            let freqs = Tensor::cat(&[&freqs, &freqs], D::Minus1).map_err(cand)?;
-            let cos = freqs
-                .cos()
-                .map_err(cand)?
-                .to_dtype(self.dtype)
-                .map_err(cand)?;
-            let sin = freqs
-                .sin()
-                .map_err(cand)?
-                .to_dtype(self.dtype)
-                .map_err(cand)?;
-            Ok((cos, sin))
-        }
-
-        /// Additive causal mask `[q_len, kv_len]`. Query `i` (absolute
-        /// `offset + i`) may attend to key positions `<= offset + i`.
-        fn causal_mask(&self, q_len: usize, kv_len: usize, offset: usize) -> Result<Tensor> {
-            let mut data = vec![0f32; q_len * kv_len];
-            for i in 0..q_len {
-                let allowed = offset + i;
-                for j in 0..kv_len {
-                    if j > allowed {
-                        data[i * kv_len + j] = f32::NEG_INFINITY;
-                    }
-                }
-            }
-            Tensor::from_vec(data, (q_len, kv_len), &self.device)
-                .map_err(cand)?
-                .to_dtype(self.dtype)
-                .map_err(cand)
-        }
     }
 
     /// Incremental KV cache for RDT decode (final-iteration K/V of the shared
