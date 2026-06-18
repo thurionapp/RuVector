@@ -1993,15 +1993,6 @@ dependencies = [
 
 [[package]]
 name = "cudarc"
-version = "0.13.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "486c221362668c63a1636cfa51463b09574433b39029326cff40864b3ba12b6e"
-dependencies = [
- "libloading 0.8.9",
-]
-
-[[package]]
-name = "cudarc"
 version = "0.17.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0bf99ab37ee7072d64d906aa2dada9a3422f1d975cdf8c8055a573bc84897ed8"
@@ -10779,7 +10770,7 @@ dependencies = [
  "candle-transformers 0.9.2",
  "chrono",
  "criterion 0.5.1",
- "cudarc 0.13.9",
+ "cudarc 0.19.7",
  "dashmap 6.1.0",
  "dirs 5.0.1",
  "futures-core",

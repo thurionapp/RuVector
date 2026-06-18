@@ -50,7 +50,7 @@
 use std::sync::Arc;
 
 use candle_core::{DType, Device, Tensor};
-use cudarc::driver::{CudaDevice, CudaSlice, LaunchAsync, LaunchConfig};
+use cudarc::driver::{CudaContext, CudaModule, CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
 use cudarc::nvrtc::compile_ptx;
 use once_cell::sync::OnceCell;
 
@@ -138,9 +138,17 @@ extern "C" __global__ void act_fused_step_bf16(
 "#;
 
 // ---------------------------------------------------------------------------
-// PTX compilation is cached globally (expensive); loading into a CudaDevice
-// is cheap and must happen per device instance (each Arc<CudaDevice> carries
-// its own module map).
+// cudarc 0.19 API:
+//   CudaContext::new(ordinal)   → Arc<CudaContext>  (was CudaDevice)
+//   ctx.default_stream()        → Arc<CudaStream>
+//   ctx.load_module(ptx)        → Arc<CudaModule>   (was dev.load_ptx)
+//   module.load_function(name)  → CudaFunction      (was dev.get_func)
+//   stream.clone_htod(&slice)   → CudaSlice<T>      (was dev.htod_sync_copy)
+//   stream.clone_dtoh(&dev)     → Vec<T>            (was dev.dtoh_sync_copy)
+//   stream.launch_builder(&f).arg(&x).launch(cfg)   (was f.launch(cfg, tuple))
+//
+// PTX is compiled once (OnceCell<Ptx>) but loaded per CudaContext instance
+// (each has its own module table).
 // ---------------------------------------------------------------------------
 
 use cudarc::nvrtc::Ptx;
@@ -156,17 +164,10 @@ fn get_or_compile_ptx() -> Result<Ptx> {
         .cloned()
 }
 
-/// Load the compiled PTX into a specific device instance.
-///
-/// Must be called for every new `Arc<CudaDevice>` before launching kernels.
-fn load_ptx_into(dev: &Arc<CudaDevice>) -> Result<()> {
+fn load_module(ctx: &Arc<CudaContext>) -> Result<Arc<CudaModule>> {
     let ptx = get_or_compile_ptx()?;
-    dev.load_ptx(
-        ptx,
-        "act_fused",
-        &["act_fused_step_f32", "act_fused_step_bf16"],
-    )
-    .map_err(|e| RuvLLMError::Model(format!("cudarc load_ptx: {e}")))
+    ctx.load_module(ptx)
+        .map_err(|e| RuvLLMError::Model(format!("cudarc load_module: {e}")))
 }
 
 // ---------------------------------------------------------------------------
@@ -178,7 +179,8 @@ fn load_ptx_into(dev: &Arc<CudaDevice>) -> Result<()> {
 /// Create one per forward pass (or cache it in the model struct for repeated
 /// inference at the same batch×sequence shape).
 pub struct FusedActKernel {
-    dev: Arc<CudaDevice>,
+    stream: Arc<CudaStream>,
+    module: Arc<CudaModule>,
     cum: CudaSlice<f32>,
     not_halted: CudaSlice<f32>,
     depth: CudaSlice<f32>,
@@ -193,28 +195,28 @@ impl FusedActKernel {
     /// Compiles and loads the PTX on the first call (cached for subsequent
     /// calls in the same process).
     pub fn new(n: usize) -> Result<Self> {
-        // CudaDevice::new returns Arc<CudaDevice> directly.
-        let dev = CudaDevice::new(0)
-            .map_err(|e| RuvLLMError::Model(format!("cudarc CudaDevice::new: {e}")))?;
-
-        load_ptx_into(&dev)?;
+        let ctx = CudaContext::new(0)
+            .map_err(|e| RuvLLMError::Model(format!("cudarc CudaContext::new: {e}")))?;
+        let stream = ctx.default_stream();
+        let module = load_module(&ctx)?;
 
         // Initialise state: cum=0, not_halted=1, depth=0, w_out=0.
-        let cum = dev
-            .htod_sync_copy(&vec![0.0f32; n])
+        let cum = stream
+            .clone_htod(vec![0.0f32; n].as_slice())
             .map_err(|e| RuvLLMError::Model(format!("htod cum: {e}")))?;
-        let not_halted = dev
-            .htod_sync_copy(&vec![1.0f32; n])
+        let not_halted = stream
+            .clone_htod(vec![1.0f32; n].as_slice())
             .map_err(|e| RuvLLMError::Model(format!("htod not_halted: {e}")))?;
-        let depth = dev
-            .htod_sync_copy(&vec![0.0f32; n])
+        let depth = stream
+            .clone_htod(vec![0.0f32; n].as_slice())
             .map_err(|e| RuvLLMError::Model(format!("htod depth: {e}")))?;
-        let w_out = dev
-            .htod_sync_copy(&vec![0.0f32; n])
+        let w_out = stream
+            .clone_htod(vec![0.0f32; n].as_slice())
             .map_err(|e| RuvLLMError::Model(format!("htod w_out: {e}")))?;
 
         Ok(Self {
-            dev,
+            stream,
+            module,
             cum,
             not_halted,
             depth,
@@ -240,71 +242,67 @@ impl FusedActKernel {
             .flatten_all()
             .map_err(|e| RuvLLMError::Model(format!("flatten p: {e}")))?;
 
+        // Scalar kernel args must be stack-local so their addresses are valid
+        // through the launch_builder().launch() call.
+        let n_i32 = self.n as i32;
+        let step_f32 = (t + 1) as f32;
+        let cfg = LaunchConfig::for_num_elems(self.n as u32);
+
         match p_flat.dtype() {
             DType::F32 => {
-                // H2D staging copy.
                 let p_host: Vec<f32> = p_flat
                     .to_vec1()
                     .map_err(|e| RuvLLMError::Model(format!("to_vec1 f32: {e}")))?;
                 let p_dev = self
-                    .dev
-                    .htod_sync_copy(&p_host)
+                    .stream
+                    .clone_htod(p_host.as_slice())
                     .map_err(|e| RuvLLMError::Model(format!("htod p_f32: {e}")))?;
-
                 let f = self
-                    .dev
-                    .get_func("act_fused", "act_fused_step_f32")
-                    .ok_or_else(|| RuvLLMError::Model("act_fused_step_f32 not loaded".into()))?;
-                let cfg = LaunchConfig::for_num_elems(self.n as u32);
+                    .module
+                    .load_function("act_fused_step_f32")
+                    .map_err(|e| RuvLLMError::Model(format!("load_function f32: {e}")))?;
                 unsafe {
-                    f.launch(
-                        cfg,
-                        (
-                            &p_dev,
-                            &mut self.cum,
-                            &mut self.not_halted,
-                            &mut self.depth,
-                            &mut self.w_out,
-                            self.n as i32,
-                            threshold,
-                            (t + 1) as f32,
-                        ),
-                    )
-                    .map_err(|e| RuvLLMError::Model(format!("launch f32: {e}")))?;
+                    self.stream
+                        .launch_builder(&f)
+                        .arg(&p_dev)
+                        .arg(&mut self.cum)
+                        .arg(&mut self.not_halted)
+                        .arg(&mut self.depth)
+                        .arg(&mut self.w_out)
+                        .arg(&n_i32)
+                        .arg(&threshold)
+                        .arg(&step_f32)
+                        .launch(cfg)
+                        .map_err(|e| RuvLLMError::Model(format!("launch f32: {e}")))?;
                 }
             }
 
             DType::BF16 => {
-                // BF16 tensor → raw u16 bits for the bf16 kernel variant.
                 let p_host: Vec<half::bf16> = p_flat
                     .to_vec1()
                     .map_err(|e| RuvLLMError::Model(format!("to_vec1 bf16: {e}")))?;
                 let p_u16: Vec<u16> = p_host.iter().map(|x| x.to_bits()).collect();
                 let p_dev = self
-                    .dev
-                    .htod_sync_copy(&p_u16)
+                    .stream
+                    .clone_htod(p_u16.as_slice())
                     .map_err(|e| RuvLLMError::Model(format!("htod p_bf16: {e}")))?;
-
                 let f = self
-                    .dev
-                    .get_func("act_fused", "act_fused_step_bf16")
-                    .ok_or_else(|| RuvLLMError::Model("act_fused_step_bf16 not loaded".into()))?;
-                let cfg = LaunchConfig::for_num_elems(self.n as u32);
+                    .module
+                    .load_function("act_fused_step_bf16")
+                    .map_err(|e| RuvLLMError::Model(format!("load_function bf16: {e}")))?;
                 unsafe {
-                    f.launch(
-                        cfg,
-                        (
-                            &p_dev,
-                            &mut self.cum,
-                            &mut self.not_halted,
-                            &mut self.depth,
-                            &mut self.w_out,
-                            self.n as i32,
-                            threshold,
-                            (t + 1) as f32,
-                        ),
-                    )
-                    .map_err(|e| RuvLLMError::Model(format!("launch bf16: {e}")))?;
+                    self.stream
+                        .launch_builder(&f)
+                        .arg(&p_dev)
+                        .arg(&mut self.cum)
+                        .arg(&mut self.not_halted)
+                        .arg(&mut self.depth)
+                        .arg(&mut self.w_out)
+                        .arg(&n_i32)
+                        .arg(&threshold)
+                        .arg(&step_f32)
+                        .launch(cfg)
+                        .map_err(|e| RuvLLMError::Model(format!("launch bf16: {e}")))?;
                 }
             }
 
@@ -317,25 +315,21 @@ impl FusedActKernel {
 
         // D2H staging copy — w_out → Candle F32 tensor.
         let w_host = self
-            .dev
-            .dtoh_sync_copy(&self.w_out)
+            .stream
+            .clone_dtoh(&self.w_out)
             .map_err(|e| RuvLLMError::Model(format!("dtoh w_out: {e}")))?;
-        let w_cpu = Tensor::from_vec(w_host, (b, seq, 1), &Device::Cpu)
-            .map_err(|e| RuvLLMError::Model(format!("from_vec w: {e}")))?;
-        // Move to the same device as the Candle tensors.
+        let w_cpu = Tensor::from_slice(&w_host, (b, seq, 1), &Device::Cpu)
+            .map_err(|e| RuvLLMError::Model(format!("from_slice w: {e}")))?;
         w_cpu
             .to_device(p_tensor.device())
             .map_err(|e| RuvLLMError::Model(format!("to_device w: {e}")))
     }
 
     /// True if all tokens have halted (`sum(not_halted) < 0.5`).
-    ///
-    /// One blocking D2H scalar copy per call; same cost as the tensor-op path's
-    /// `sum_all().to_scalar()`.
     pub fn all_halted(&self) -> Result<bool> {
         let v = self
-            .dev
-            .dtoh_sync_copy(&self.not_halted)
+            .stream
+            .clone_dtoh(&self.not_halted)
             .map_err(|e| RuvLLMError::Model(format!("dtoh not_halted: {e}")))?;
         Ok(v.iter().sum::<f32>() < 0.5)
     }
@@ -343,8 +337,8 @@ impl FusedActKernel {
     /// Per-token halt iteration (for depth telemetry). One D2H copy.
     pub fn depths(&self) -> Result<Vec<usize>> {
         let v = self
-            .dev
-            .dtoh_sync_copy(&self.depth)
+            .stream
+            .clone_dtoh(&self.depth)
             .map_err(|e| RuvLLMError::Model(format!("dtoh depth: {e}")))?;
         Ok(v.iter().map(|&d| d as usize).collect())
     }

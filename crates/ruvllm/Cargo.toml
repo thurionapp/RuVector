@@ -69,10 +69,8 @@ candle-nn = { version = "0.9", optional = true }
 candle-transformers = { version = "0.9", optional = true }
 
 # Direct cudarc access for fused CUDA kernels (fused-act feature).
-# Pinned to 0.13 — act_kernel.rs uses the 0.13 tuple-based launch API.
-# cudarc 0.13 and 0.19 can coexist: each manages its own device context
-# (the staging-buffer path never shares types with candle's cudarc 0.19).
-cudarc = { version = "0.13", optional = true, default-features = false, features = ["nvrtc", "driver", "std"] }
+# Upgraded to 0.19 alongside candle 0.9 — supports CUDA 13.0 natively.
+cudarc = { version = "0.19", optional = true, default-features = false, features = ["nvrtc", "driver", "std"] }
 
 # Tokenizers
 tokenizers = { version = "0.20", optional = true, default-features = false, features = ["onig"] }
