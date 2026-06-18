@@ -71,7 +71,7 @@ CUDA benches require `--features candle,cuda` with CUDA 12.8 (cudarc 0.13.9 does
 
 ## Consequences
 
-### Performance (RTX 5080, SM 12.0, CUDA 12.8)
+### Prefill performance (RTX 5080, SM 12.0, CUDA 12.8)
 
 | Model | Seq | CPU F32 | CUDA F32 | CUDA BF16 | GPU Speedup |
 |-------|-----|---------|----------|-----------|-------------|
@@ -98,8 +98,17 @@ On CPU, the vectorized path adds small overhead for tensor-operator dispatch ver
 
 ### Build notes
 
-- Requires CUDA 12.8 for the `cuda` feature on this workstation (cudarc 0.13.9 panics on CUDA 13.0; `/usr/local/cuda-12.8` is available).
+- After upgrading to candle 0.9 + cudarc 0.19 (see post-merge section), CUDA 13.0 is supported natively — no `CUDA_HOME` workaround needed.
 - All 1582 tests pass under both `candle` and `candle,cuda` feature flags.
+
+### Decode performance (after post-merge optimizations)
+
+| Benchmark | Before | After | Δ |
+|-----------|--------|-------|---|
+| CPU decode prompt32_gen16 | 73.4 ms | 62.3 ms | **-15%** |
+| CUDA/BF16 decode prompt32_gen16 | 48.9 ms | 44.3 ms | **-9.4%** |
+
+Primary sources: KV cache pre-allocation via `scatter_set` (O(N²)→O(N) cat bandwidth + eliminate `cuMemAlloc` per step); on-device argmax (128KB→4B per greedy step); GPU top-k sort for sampling (128KB→320B per sampling step).
 
 ---
 
