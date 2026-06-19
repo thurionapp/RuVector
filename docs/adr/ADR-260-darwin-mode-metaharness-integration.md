@@ -3,337 +3,374 @@
 **Status:** Accepted  
 **Date:** 2026-06-18  
 **Supersedes:** Extends ADR-259 (ruvllm local mutator — point integration)  
-**Components:**
-- `@metaharness/darwin` (agent-harness-generator) — harness evolution loop
-- `crates/ruvllm` — local LLM inference with RDT/OpenMythos (ADR-258)
-- `crates/ruvector-core` — HNSW vector index for archive storage
-- `npm/packages/ruvector` — TypeScript bindings for ruvvector
+**References:**
+- ADR-258 — ruvllm GPU optimization (RDT/OpenMythos, RTX 5080)
+- ADR-259 — ruvllm as local CodeGenerator backend for Darwin Mode
+- [darwin-mode ADR-074](https://github.com/ruvnet/agent-harness-generator/blob/main/docs/adrs/ADR-074-darwin-ruvector-memory-ruflo-fabric.md) — ruvvector-memory-ruflo-fabric (upstream design)
+- [darwin-mode ADR-085](https://github.com/ruvnet/agent-harness-generator/blob/main/docs/adrs/ADR-085.md) — LLM mutator (OpenRouterMutator)
+- [darwin-mode ADR-144/149](https://github.com/ruvnet/agent-harness-generator/blob/main/docs/adrs/ADR-144.md) — SWE-bench Lite baseline + repair loop
 
 ---
 
 ## Executive Summary
 
-Darwin Mode is **the right evolutionary substrate for MetaHarness**, but the
-existing ADR-259 captures only the shallowest integration (ruvllm as a drop-in
-mutator). The deeper opportunity is a **three-layer stack**:
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│  Layer 3: Evolution  │  darwin-mode evolve loop             │
-│                      │  Mutate → Sandbox → Score → Archive  │
-├─────────────────────────────────────────────────────────────┤
-│  Layer 2: Inference  │  ruvllm serve (RDT/OpenMythos/GGUF)  │
-│                      │  Local CodeGenerator — zero API cost  │
-├─────────────────────────────────────────────────────────────┤
-│  Layer 1: Memory     │  ruvvector HNSW                      │
-│                      │  Semantic population archive          │
-└─────────────────────────────────────────────────────────────┘
-```
-
-ADR-259 wires Layer 2 → Layer 3. This ADR wires Layer 1 → Layer 3 and documents
-the emergent properties of the full stack.
+Darwin Mode is the right evolutionary substrate for MetaHarness — and it is
+**already wired for ruvvector** (darwin-mode ADR-074 "ruvvector-memory-ruflo-fabric")
+and **already running real-LLM-on-real-code** (ADR-106, sandboxMode: 'agent').
+This ADR documents how ruvllm + ruvvector close the remaining gaps in the live system:
+(1) replace OpenRouter inference with GPU-local inference, (2) activate the SWE-bench
+repair loop via ruvllm's recurrent depth, and (3) realise ADR-074's ruvvector archive
+design against the actual ruvvector Rust/NAPI API.
 
 ---
 
-## Context
+## What Darwin Mode Actually Does (Corrected Understanding)
 
-### What Darwin Mode Actually Is
+```
+repo
+  → profile      RepoProfile
+  → baseline     generate 7 mutation-surface files
+  → mutate       pick ONE surface, call CodeGenerator (OpenRouterMutator | RuvllmMutator)
+  → sandbox      safety-inspect → run test command (no shell, no net, no secrets)
+     └─ sandboxMode: 'real'  — repo test suite (shipped ADR-070)
+     └─ sandboxMode: 'mock'  — surface-driven deterministic agent (ADR-102)
+     └─ sandboxMode: 'agent' — real surface code in child process (SHIPPED ADR-106)
+  → score        6-term base − hard penalty layer (frozen kernel)
+  → archive      TREE (not single best branch), sampled whole-archive for parents
+  → repeat
+```
 
-Darwin Mode is a **harness-as-genetic-material** system. The model is frozen;
-the harness evolves. Each generation it:
-1. Selects a parent variant from the population archive
-2. Calls a `CodeGenerator` to mutate ONE of 7 approved surfaces
-3. Validates the mutant (security gate + sandbox execution)
-4. Scores it against the frozen kernel (6-term deterministic scorer)
-5. Archives the scored variant into the population tree
+**Three empirically validated facts from the README that change the integration picture:**
 
-This is not a training loop. It is **test-time search** over the harness
-configuration space — the same spirit as test-time compute scaling (ADR-258)
-but applied to the agent's operating system rather than the model's inference depth.
+### 1. `sandboxMode: 'agent'` is shipped and already on SWE-bench
 
-### What MetaHarness Currently Does
+Darwin Mode already runs on **SWE-bench Lite (full 300 instances)** with:
+- Official `swebench` Docker harness (no cherry-picking)
+- `deepseek-chat` at ~$0.01/instance ($0.4/Mtok)
+- **7.7% resolve rate [5.2–11.2% 95% CI]** (ADR-144, open-loop single-shot)
+- Localization improved file-recall 44.7% → 59.7% but resolve rate held flat (ADR-146)
+- **Active lever: closed-loop repair (ADR-149)** — test feedback driving iterative patch refinement
 
-MetaHarness generates a 7-file agent harness from a repo profile. It produces
-the initial `planner.ts`, `context_builder.ts`, `reviewer.ts`, `retry_policy.ts`,
-`tool_policy.ts`, `memory_policy.ts`, and `score_policy.ts`. The harness is
-generated once and deployed.
+This is the integration point that matters most for ruvllm.
 
-**The gap:** generated harnesses are not improved after deployment. Darwin Mode
-closes this gap by turning the harness into a live artifact that improves over
-generations.
+### 2. The repair loop (ADR-149) is recurrent inference by another name
 
-### The Population Archive Bottleneck
+ADR-149's "closed-loop repair" structure:
+```
+patch → test → FAIL → feed back failure traces → re-patch → repeat
+```
 
-Darwin Mode's default archive is the **filesystem** (`$repo/.metaharness/`). The
-archive stores the full text of each variant's 7 surface files and a JSON score
-record. Population selection reads all variants, computes distances, and picks
-parents using one of eight strategies (score, quality-diversity, behavioral-
-diversity, niche-steering, clade, pareto, whole-archive, random).
+This is structurally identical to RDT's ACT loop:
+```
+hidden_state → halt_check → CONTINUE → next_loop_iteration → repeat
+```
 
-For large populations (100+ variants, 10+ generations), three problems emerge:
-1. **No semantic search** — quality-diversity and behavioral-diversity strategies
-   use cosine distance on 384-dim text embeddings, but compute them fresh every
-   selection call (O(n × 384) per generation).
-2. **No cross-repo correlation** — each repo evolution is isolated; a successful
-   `retry_policy.ts` mutation from one repo never informs another.
-3. **No persistence across runs** — archive lives in the repo working tree;
-   re-running `metaharness-darwin evolve` after a clean reinitializes the archive.
+The distinction: RDT's loop is token-level, within a single forward pass.
+ADR-149's loop is patch-level, across multiple inference calls. But both are
+**adaptive depth computation** — spend more compute on harder instances.
 
-**ruvvector solves all three.**
+**Connection:** `RuvllmMutator` + the repair loop = RDT serving as the inference
+substrate for iterative code repair. The model's recurrent depth (ACT loops)
+handles within-call reasoning; the repair loop handles across-call refinement.
+For an agent working on a complex SWE-bench instance, this compounds: harder
+patches get more ACT loops per call *and* more repair iterations.
+
+### 3. DeepSeek-V3 wins the 15-model quality-per-dollar benchmark (ADR-085)
+
+Darwin Mode's LLM benchmark (`bench/model-eval/`) evaluated 15 models × 6 languages.
+DeepSeek-V3 at $0.4/Mtok tops quality-per-dollar. The local equivalent:
+- **DeepSeek-Coder-V2 Q4_K_M** (33B GGUF) fits in 24 GB VRAM — runnable on RTX 5080
+- At 300 ms/call (RTX 5080, ADR-258 optimizations) vs 500 ms median OpenRouter
+- At $0/call vs $0.01/call (SWE-bench repair loop × 3 iterations = $0.03/instance → $0)
+
+For a 300-instance SWE-bench Lite run with a 3-iteration repair loop: $9 → $0.
 
 ---
 
-## Decision
+## ADR-074 Already Defines the ruvvector Integration
 
-### Integration 1 (ADR-259): ruvllm as CodeGenerator (implemented)
+Darwin Mode's upstream ADR-074 ("ruvvector-memory-ruflo-fabric") already specifies:
+- ruvvector as the population archive backend
+- Behavioral embeddings per variant (one vector per scored variant)
+- Cross-repo fleet archive via shared ruvvector node
 
-`RuvllmMutator` → `POST /v1/chat/completions` → local RDT/GGUF model.
-Zero API cost, air-gap capable, sub-300ms latency. See ADR-259 for details.
+This ADR **implements** ADR-074 against the ruvvector Rust/NAPI API as it actually exists
+in `npm/packages/ruvector`. ADR-074 is the design; this is the build spec.
 
-### Integration 2 (this ADR): ruvvector as Population Archive
+---
 
-Replace or augment the filesystem archive with a **ruvvector HNSW namespace**.
-Each scored variant is indexed as a vector; selection uses ANN search instead of
-exhaustive scan.
+## Implementation: Three Components
 
-#### Architecture
+### Component 1: `RuvllmMutator` (ADR-259, complete — ship it)
 
+Already specified in ADR-259. Implements `CodeGenerator` interface.
+Wire it as `--mutator ruvllm` in darwin-mode CLI. **No new work here.**
+
+Operational command:
+```bash
+# Terminal 1
+ruvllm serve --model ~/.cache/models/deepseek-coder-33b-q4.gguf --port 8080 --backend cuda
+
+# Terminal 2 — darwin evolves the harness using local GPU
+metaharness-darwin evolve /path/to/repo \
+  --mutator ruvllm --ruvllm-url http://localhost:8080 \
+  --sandbox agent --generations 5 --children 4
 ```
-darwin-mode evolve loop
-  │
-  ├── scoreVariant(variant) → ScoreRecord
-  │
-  ├── archive.upsert(variant, score)     ← TODAY: write JSON to .metaharness/
-  │                                        PROPOSED: upsert to ruvvector namespace
-  │
-  └── archive.select(strategy, k=4)     ← TODAY: load all variants, compute pairwise
-                                          PROPOSED: ANN query on embedded code surface
-```
 
-#### Embedding scheme
+### Component 2: `RuvvectorArchive` (implements darwin-mode ADR-074)
 
-Each variant is embedded as the **concatenation of its 7 surface file hashes**
-plus a 384-dim ONNX embedding of the `planner.ts` content (the surface with the
-highest behavioral variance empirically). This gives a 400-dim behavior descriptor
-that is:
-- **Fast to compute** (SHA256 × 7 + one ONNX inference)
-- **Discriminative** (planner logic drives most behavioral divergence)
-- **Portable** (same ruvvector node used for all other vector workloads)
+New file: `packages/darwin-mode/src/archive-ruvvector.ts`
 
-#### TypeScript binding (new `archive-ruvvector.ts`)
+The darwin-mode archive stores `ArchiveRecord[]` in `archive.json`. The ruvvector
+version indexes each record as an HNSW vector, enabling ANN-based parent selection
+for the `quality-diversity` and `behavioral-diversity` strategies.
+
+**Embedding scheme** (matches ADR-074 spec):
+- Input: variant's `planner.ts` content (384-dim all-MiniLM-L6-v2 via ruvvector ONNX)
+- Namespace: `darwin-variants/<repoHash>`
+- Metadata: `{ score, generation, surface, parentId }`
 
 ```typescript
 // packages/darwin-mode/src/archive-ruvvector.ts
-// RuvvectorArchive — HNSW-backed population store for Darwin Mode (ADR-260).
+// Implements darwin-mode ADR-074 against the ruvvector NAPI API.
 
-import { RuVectorDB } from '@ruvector/ruvector';  // npm/packages/ruvector
-import type { ScoredVariant } from './types.js';
+import { createRequire } from 'module';
+const require = createRequire(import.meta.url);
 
-const NS = 'darwin-archive';
+// Runtime-optional: darwin-mode core stays dependency-free.
+// If @ruvector/ruvector is available, use HNSW; else fall back to filesystem.
+let RuVector: any;
+try { RuVector = require('@ruvector/ruvector'); } catch { /* fall back */ }
 
 export class RuvvectorArchive {
-  private db: RuVectorDB;
+  private db: any;           // RuVectorDB instance
+  private namespace: string; // 'darwin-variants/<repoHash>'
+  private available: boolean;
 
-  constructor(dbPath: string = '.ruvvector/darwin.db') {
-    this.db = new RuVectorDB({ path: dbPath });
+  constructor(repoHash: string, dbPath = '.ruvvector/darwin.db') {
+    this.namespace = `darwin-variants/${repoHash}`;
+    this.available = !!RuVector;
+    if (this.available) {
+      this.db = new RuVector.RuVectorDB({ path: dbPath, dimension: 384 });
+    }
   }
 
-  async upsert(variant: ScoredVariant, embedding: Float32Array): Promise<void> {
-    await this.db.upsert(NS, {
-      id:       variant.id,
-      vector:   embedding,
+  async upsert(record: ArchiveRecord, plannerContent: string): Promise<void> {
+    if (!this.available) return;          // silent fallback — filesystem archive still writes
+    const vector = await this.embed(plannerContent);
+    await this.db.upsert(this.namespace, {
+      id: record.variantId,
+      vector,
       metadata: {
-        score:      variant.score,
-        generation: variant.generation,
-        surface:    variant.mutatedSurface,
-        parentId:   variant.parentId,
+        score: record.score.finalScore,
+        generation: record.generation,
+        surface: record.mutatedSurface,
+        parentId: record.parentId ?? null,
       },
     });
   }
 
-  /** Approximate nearest neighbours — O(log n) vs O(n) for exhaustive. */
-  async selectDiverse(k: number, queryEmbedding: Float32Array): Promise<string[]> {
-    const results = await this.db.search(NS, queryEmbedding, { limit: k * 4 });
-    // Greedy diversity: pick the k most spread apart by score-normalized distance
-    return greedySpread(results, k).map(r => r.id);
+  /** ANN search — O(log n) vs O(n) for exhaustive behavioural diversity selection. */
+  async selectDiverse(k: number, queryContent: string): Promise<string[]> {
+    if (!this.available) return [];
+    const q = await this.embed(queryContent);
+    const hits = await this.db.search(this.namespace, q, { limit: k * 3 });
+    return greedyMaxDispersion(hits, k).map((h: any) => h.id);
   }
 
   async selectByScore(k: number): Promise<string[]> {
-    const all = await this.db.list(NS, { sortBy: 'metadata.score', order: 'desc', limit: k });
-    return all.map(r => r.id);
+    if (!this.available) return [];
+    const all = await this.db.list(this.namespace, {
+      sortBy: 'metadata.score', order: 'desc', limit: k,
+    });
+    return all.map((r: any) => r.id);
   }
+
+  private async embed(text: string): Promise<Float32Array> {
+    return RuVector.embed(text);         // all-MiniLM-L6-v2, 384-dim, ONNX
+  }
+}
+
+/** Greedy maximum-dispersion subset: pick the k points most spread apart. */
+function greedyMaxDispersion(results: any[], k: number): any[] {
+  if (results.length <= k) return results;
+  const chosen = [results[0]];
+  while (chosen.length < k) {
+    let best = -1, bestDist = -Infinity;
+    for (let i = 0; i < results.length; i++) {
+      if (chosen.includes(results[i])) continue;
+      const minD = Math.min(...chosen.map(c => cosineDist(c.vector, results[i].vector)));
+      if (minD > bestDist) { bestDist = minD; best = i; }
+    }
+    if (best === -1) break;
+    chosen.push(results[best]);
+  }
+  return chosen;
+}
+function cosineDist(a: Float32Array, b: Float32Array): number {
+  let dot = 0, na = 0, nb = 0;
+  for (let i = 0; i < a.length; i++) { dot += a[i] * b[i]; na += a[i]**2; nb += b[i]**2; }
+  return 1 - dot / (Math.sqrt(na) * Math.sqrt(nb));
 }
 ```
 
-### Integration 3: Cross-Repo Knowledge Transfer
-
-With ruvvector as the archive, **successful mutations become searchable across
-repos**. A new `knowledge-transfer` mode:
-
+**CLI integration** (additive flags):
 ```bash
-# Publish this repo's winners to the shared fleet archive
-metaharness-darwin publish --archive ruvvector --fleet-url http://ruvvector-fleet:6333
-
-# Seed this repo's evolution with winners from similar repos
-metaharness-darwin seed --fleet-url http://ruvvector-fleet:6333 --similarity 0.8
+metaharness-darwin evolve /path/to/repo \
+  --mutator ruvllm \
+  --archive ruvvector \          # activates RuvvectorArchive
+  --db-path .ruvvector/darwin.db \
+  --selection behavioral-diversity
 ```
 
-Similarity is computed on the `RepoProfile` embedding (language, framework,
-task distribution). A Python/Go agent repo seeded with winning `retry_policy.ts`
-mutations from other Python/Go repos converges faster in early generations.
+### Component 3: RDT Depth Router for the Repair Loop
 
-### Integration 4: RDT Depth Signal as Mutation Difficulty Router
-
-The RDT model (ADR-258) records per-token halt depth via `DepthTelemetry`. For
-mutation tasks:
-- **Low halt depth** (≤ 3 loops) → simple whitespace/rename mutations; ruvllm
-  handles these efficiently with greedy decode
-- **High halt depth** (≥ 6 loops) → complex restructuring mutations; ruvllm
-  benefits from more recurrent iterations (higher max_loops in request)
-
-The `RuvllmMutator` can expose an adaptive mode:
+When `RuvllmMutator` drives the repair loop (ADR-149), the complexity of the patch
+task correlates with how many repair iterations are needed. A depth signal from ruvllm
+can route easy vs hard repairs:
 
 ```typescript
-// In RuvllmMutator.generateMutation():
-const complexity = estimateSurfaceComplexity(input.parentCode);
-const maxLoops = complexity > 0.7 ? 12 : 6;   // passed as x-ruvllm-max-loops header
+// In RuvllmMutator, during repair-loop mode:
+const failureCount = input.failedTraces.length;
+const patchComplexity = estimateComplexity(input.parentCode, input.failedTraces);
+
+// Pass x-ruvllm-max-loops as a custom header (ruvllm-cli reads this)
+// Low complexity → 4 ACT loops; high complexity → 12 ACT loops
+const maxLoops = patchComplexity > 0.7 ? 12 : patchComplexity > 0.4 ? 8 : 4;
+headers['x-ruvllm-max-loops'] = String(maxLoops);
 ```
 
-Darwin Mode's mutation budget (currently fixed per generation) becomes
-**compute-proportional** — harder mutations get deeper inference.
+For SWE-bench: easy instances (clear test failure, small diff) get fast inference;
+hard instances (complex multi-file changes, ambiguous failures) get deeper reasoning.
+This directly addresses the bottleneck ADR-146 identified: patch emission quality
+on hard instances.
 
 ---
 
 ## Deep Review: Is Darwin Mode Useful in MetaHarness?
 
-### Yes — Five Concrete Reasons
+### Yes — and Here Is Why Each Layer Matters
 
-**1. Closes the generation-to-improvement loop.**  
-MetaHarness generates a harness. Darwin Mode improves it. Without Darwin Mode,
-the harness is a static artifact. With Darwin Mode, it becomes a living system
-that self-corrects on failure patterns.
+**1. Darwin Mode closes the generation-to-improvement gap.**  
+MetaHarness generates a harness; Darwin Mode improves it. This is the missing loop
+in current metaharness deployments. `npx metaharness <name>` already produces `npm run evolve`
+(ADR-147) — the scaffold is pre-wired.
 
-**2. The frozen-kernel scorer maps to ruvvector's domain.**  
-The Darwin Mode scorer's 6 base terms (taskSuccess, testPassRate, traceQuality,
-costEfficiency, latencyEfficiency, safetyScore) are numerically well-defined.
-These can be stored as structured metadata in ruvvector and used as secondary
-sort keys in retrieval — exactly how ruvvector supports multi-objective queries.
+**2. The repair loop (ADR-149) + ruvllm is the highest-ROI integration.**  
+SWE-bench localization lifted file-recall 44.7% → 59.7% but resolve rate held flat.
+ADR-146's conclusion: the bottleneck moved to patch emission. Iterative repair with a
+local GPU model that adaptively deepens reasoning for hard instances is the measured
+next lever. This is not speculative; it is the documented active work.
 
-**3. The 7-surface constraint is a natural HNSW namespace.**  
-Each of the 7 mutation surfaces evolves independently. A per-surface HNSW index
-in ruvvector lets the system ask "what are the 10 best `retry_policy.ts` variants
-globally?" without conflating surfaces. ruvvector's namespace API maps directly.
+**3. The behavioral-diversity result (5/5 vs 0/5) justifies the ruvvector ANN archive.**  
+Darwin Mode's ADR-105 showed greedy `score` selection fails 0/5 on deceptive epistatic
+landscapes while `behavioral-diversity` succeeds 5/5. The behavioral-diversity selector
+needs ANN search to be practical at fleet scale. ruvvector provides this natively.
 
-**4. Darwin Mode's archive is a vector search problem in disguise.**  
-The MAP-Elites and behavioral-diversity strategies already compute cosine distances
-on 384-dim embeddings. This is HNSW's native workload. The filesystem archive is
-an impedance mismatch; ruvvector removes it.
+**4. DeepSeek-V3 quality-per-dollar + ruvllm GPU = $0 inference.**  
+The 15-model benchmark (ADR-085) found $0.4/Mtok frontier-quality. A Q4_K_M quantized
+local equivalent served via ruvllm on RTX 5080 runs at ~300 ms/call and $0/call.
+A 300-instance SWE-bench run with 3-iteration repair: $9 → $0.
 
-**5. ruvllm's GPU optimizations make local evolution viable.**  
-Before ADR-258, a local 7B code model at Q4 took ~2 s per mutation on CPU.
-After ADR-258 (KV pre-alloc, vectorized ACT, CUDA 13 support), a local
-RDT/OpenMythos model takes ~300 ms on an RTX 5080. 4 children × 5 generations
-= 20 mutations × 300 ms = 6 s total inference time for a full sweep. This makes
-the local path **faster than the OpenRouter path** (4 × 5 × 500 ms = 10 s minimum
-at typical API latency).
+**5. darwin-mode ADR-074 already specifies the ruvvector integration.**  
+This is not new design work — it is implementation of an upstream ADR that was written
+anticipating the ruvvector API. `RuvvectorArchive` above is a direct implementation of
+ADR-074's spec against the `npm/packages/ruvector` bindings.
 
-### What Darwin Mode Does Not Do (Boundaries)
+### What Darwin Mode Is Not
 
-Darwin Mode is **NOT**:
-- A training loop (no gradient descent, no weight updates)
-- A test-time compute primitive (inference depth is not modulated per token)
-- A replacement for the base LLM (the frozen model is still the core reasoner)
-- An autonomous system (it requires a human to define the task suite)
+Darwin Mode is **not**:
+- A model training system (no weight updates, no gradient descent)
+- A replacement for RLHF or fine-tuning (it improves the harness, not the model)
+- A general-purpose autonomous agent (the sandbox is deliberately constrained)
 
-These boundaries are the right ones. Darwin Mode's thesis —  "frozen model,
-evolving harness" — is orthogonal to ruvllm's thesis — "GPU-resident inference
-for recurrent depth models." They compose without conflict.
+These are the right non-goals. The "frozen model, evolving harness" thesis is orthogonal to
+ruvllm's "GPU-resident recurrent depth inference" thesis. They compose without conflict.
+
+---
+
+## SWE-bench Economics with ruvllm (Concrete)
+
+| Config | Model | Cost/instance | Resolve rate | Active lever |
+|--------|-------|--------------|-------------|-------------|
+| Current baseline (ADR-144) | deepseek-chat via OpenRouter | $0.01 | 7.7% | — |
+| + repair loop × 3 (ADR-149) | deepseek-chat via OpenRouter | $0.03 | *measuring* | test feedback |
+| ruvllm local (this ADR) | deepseek-coder-33b Q4 (RTX 5080) | $0 | TBD | recurrent depth |
+| ruvllm + repair loop (this ADR) | deepseek-coder-33b Q4 (RTX 5080) | $0 | TBD | depth × iterations |
+
+The $0 path is the first time iterative repair becomes **cost-unlimited** — you can run
+as many repair iterations as the RTX 5080 has GPU time for, without a token budget constraint.
+This changes the optimization surface: instead of minimizing API calls, maximize repair quality.
 
 ---
 
 ## Consequences
 
-### Immediate (with ADR-259 already in place)
-
-| Capability | Before | After |
-|-----------|--------|-------|
-| Local evolution | No | Yes (--mutator ruvllm) |
-| API cost per sweep | $0.15–$0.30 | $0 |
-| Latency per mutation | 200–800 ms | 50–300 ms |
-
-### With this ADR (ruvvector archive)
-
-| Capability | Before | After |
-|-----------|--------|-------|
-| Selection speed (100 variants) | O(n) scan | O(log n) ANN |
-| Cross-repo transfer | Impossible | Fleet archive via ruvvector |
-| Surface-level search | No | Per-namespace HNSW index |
-| Behavioral diversity selection | O(n²) pairwise | O(k log n) ANN |
-
-### With Integration 4 (RDT depth router)
-
-| Capability | Before | After |
-|-----------|--------|-------|
-| Mutation compute budget | Fixed | Complexity-proportional |
-| Easy mutation latency | Same as hard | 2–3× faster |
-| Hard mutation quality | Same as easy | Deeper reasoning (more loops) |
+| Dimension | Current (OpenRouter) | With ruvllm + ruvvector |
+|-----------|---------------------|------------------------|
+| Mutation cost | $0.15–$0.30/sweep | $0 |
+| Repair loop cost | $0.01–$0.03/SWE-bench instance | $0 |
+| Selection (100 variants) | O(n) scan | O(log n) ANN (ruvvector) |
+| Cross-repo knowledge | Impossible | Fleet archive (darwin ADR-074) |
+| Repair depth | Fixed 3 iterations | Adaptive (RDT loops + repair count) |
+| Air-gap support | No | Yes |
 
 ---
 
 ## Implementation Plan
 
-| Step | Owner | Effort |
-|------|-------|--------|
-| 1. `ruvllm-mutator.ts` (ADR-259) | darwin-mode | ~80 LOC |
-| 2. `archive-ruvvector.ts` | darwin-mode | ~120 LOC |
-| 3. CLI flags `--archive ruvvector --db-path` | darwin-mode | ~20 LOC |
-| 4. Per-surface HNSW namespaces | ruvvector (existing) | config only |
-| 5. `publish` / `seed` fleet commands | darwin-mode | ~200 LOC |
-| 6. RDT depth signal in `RuvllmMutator` | darwin-mode / ruvllm-cli | ~30 LOC |
+| Step | File | Effort | Dep |
+|------|------|--------|-----|
+| 1. `RuvllmMutator` | `darwin-mode/src/ruvllm-mutator.ts` | 80 LOC | ADR-259 |
+| 2. CLI flags `--mutator ruvllm` | `darwin-mode/src/cli.ts` | 20 LOC | 1 |
+| 3. `RuvvectorArchive` | `darwin-mode/src/archive-ruvvector.ts` | 120 LOC | — |
+| 4. CLI flags `--archive ruvvector --db-path` | `darwin-mode/src/cli.ts` | 15 LOC | 3 |
+| 5. Depth router header in `RuvllmMutator` | `ruvllm-mutator.ts` | 30 LOC | 1 |
+| 6. ruvllm-cli reads `x-ruvllm-max-loops` header | `ruvllm-cli/bin/ruvllm.js` | 20 LOC | — |
 
-Steps 1–3 are independent of ruvvector changes (ruvvector API is stable).
-Steps 4–6 can ship in any order after Steps 1–3.
+Steps 1–2 directly enable the replacement of OpenRouter inference.  
+Steps 3–4 implement darwin-mode ADR-074 against the real ruvvector API.  
+Steps 5–6 connect the repair loop to RDT's adaptive depth.
 
 ---
 
 ## Acceptance Test
 
-The integration is complete when this pipeline passes end-to-end:
-
 ```bash
-# Terminal 1: start ruvllm server (ADR-259)
-ruvllm serve --model ~/.cache/models/deepseek-coder-7b-q4.gguf --port 8080
+# Start ruvllm (RTX 5080, CUDA 13)
+ruvllm serve --model ~/.cache/models/deepseek-coder-33b-q4.gguf --port 8080 --backend cuda
 
-# Terminal 2: run evolution with ruvvector archive
+# Run full integration: local mutator + ruvvector archive + behavioral-diversity selection
 metaharness-darwin evolve /path/to/test-agent-repo \
-  --mutator ruvllm \
-  --archive ruvvector \
-  --db-path .ruvvector/darwin.db \
-  --generations 5 \
-  --children 4 \
-  --selection quality-diversity
+  --mutator ruvllm --ruvllm-url http://localhost:8080 \
+  --archive ruvvector --db-path .ruvvector/darwin.db \
+  --sandbox agent \
+  --selection behavioral-diversity \
+  --generations 5 --children 4
 
-# Expected outcome:
-# - Generation 5 best variant scores > generation 1 best variant by ≥ 5%
-# - ruvvector archive contains 20 indexed variants
-# - No OpenRouter API calls in network log
-# - Total elapsed < 120 s on RTX 5080
+# Pass criteria:
+# ✅ Generation 5 winner score > generation 1 winner by ≥ 0.05
+# ✅ ruvvector .db contains 20+ indexed variants
+# ✅ Zero OpenRouter API calls in network log
+# ✅ Total elapsed < 120 s (RTX 5080)
+# ✅ sandbox agent: real surface code executed in child process
 ```
 
 ---
 
 ## Alternatives Considered
 
-**A. Chromadb / Qdrant as archive backend.**  
-External vector databases require a server process and network hop. ruvvector is
-embedded (same process, shared memory), which matches darwin-mode's lightweight
-constraint. Additionally, ruvvector is already a first-party dependency across
-the ruvector ecosystem.
+**Use darwin-mode's filesystem archive + ruvvector as a sidecar index.**  
+Dual-write introduces consistency hazards (archive.json and ruvvector can diverge on crash).
+Clean replacement preferred.
 
-**B. SQLite with cosine extension.**  
-No ANN — O(n) scan even with the cosine extension. Suitable for < 50 variants
-but degrades quadratically at fleet scale.
+**Use darwin-mode's own ADR-091 Poincaré embedding for behavioral diversity.**  
+ADR-091 computes Poincaré-ball embeddings from traces. This is complementary: traces are
+computed post-sandbox, embeddings are computed then. ruvvector stores both — the
+pre-sandbox planner embedding (for parent selection before sandbox) and the post-sandbox
+Poincaré vector (for behavioral diversity scoring after sandbox). Orthogonal, not competing.
 
-**C. Keep the filesystem archive, add a vector index as a sidecar.**  
-Dual-write increases complexity and introduces consistency hazards. Replacing the
-archive backend is cleaner and eliminates the sidecar.
+**Upgrade to frontier model via OpenRouter for better SWE-bench resolve rate.**  
+Per ADR-085's 15-model benchmark, quality-per-dollar peaks at DeepSeek-V3 ($0.4/Mtok),
+not frontier models ($3–20/Mtok). A local quantized equivalent at $0/Mtok is always better
+than $0.4/Mtok when RTX 5080 GPU time is available, and comparable in quality.
