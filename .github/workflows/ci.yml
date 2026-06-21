@@ -212,12 +212,44 @@ jobs:
               # follow-up — fix is to gate the affected modules behind
               # `#[cfg(target_arch = "wasm32")]` or migrate to
               # wasm-bindgen-test runners.
+          - name: research-nightly
+            # Nightly research PoC crates (iter 240+). Kept in a separate shard
+            # so their compile + test time doesn't inflate core-and-rest.
+            # timeout-minutes is intentionally tight — if a research crate
+            # takes more than 30 min it signals an unbounded benchmark in tests.
+            packages: >-
+              -p ruvector-lsm-ann
+              -p ruvector-matryoshka
+              -p ruvector-pq-search
+              -p ruvector-hybrid
+              -p ruvector-hnsw-repair
+              -p ruvector-coherence-hnsw
+              -p ruvector-maxsim
+              -p photonlayer-core
+              -p photonlayer-bench
+              -p photonlayer-cli
+              -p photonlayer-wasm
+              -p photonlayer-ruvector
+            timeout-minutes: 30
           - name: core-and-rest
             # Everything else: core, delta, server/cluster, etc.
             # Uses --workspace + --exclude to subtract the groups above so we
             # don't have to enumerate ~100 crates by hand.
             packages: >-
               --workspace
+              # Nightly research crates run in the research-nightly shard (iter 240+)
+              --exclude photonlayer-core
+              --exclude photonlayer-bench
+              --exclude photonlayer-cli
+              --exclude photonlayer-wasm
+              --exclude photonlayer-ruvector
+              --exclude ruvector-lsm-ann
+              --exclude ruvector-matryoshka
+              --exclude ruvector-pq-search
+              --exclude ruvector-hybrid
+              --exclude ruvector-hnsw-repair
+              --exclude ruvector-coherence-hnsw
+              --exclude ruvector-maxsim
               --exclude ruvector-postgres
               --exclude ruvector-decompiler
               --exclude ruvllm

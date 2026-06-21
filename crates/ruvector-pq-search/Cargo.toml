@@ -7,6 +7,9 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 description = "Product Quantization with Asymmetric Distance Computation (ADC) for compressed approximate nearest-neighbor search — Flat PQ, IVF+PQ, and Residual-corrected PQ variants in safe Rust"
+readme = "README.md"
+keywords = ["vector-search", "ann", "product-quantization", "compression", "approximate-search"]
+categories = ["algorithms", "data-structures", "science"]
 
 [[bin]]
 name = "pq-benchmark"

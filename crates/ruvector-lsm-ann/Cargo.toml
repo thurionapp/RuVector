@@ -6,6 +6,9 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "LSM-ANN: write-optimized streaming vector index with multi-tier compaction for agent memory"
+readme = "README.md"
+keywords = ["vector-search", "ann", "lsm-tree", "streaming", "agent-memory"]
+categories = ["algorithms", "data-structures", "science"]
 
 [[bin]]
 name = "benchmark"

@@ -6,6 +6,7 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Matryoshka-aware coarse-to-fine vector search: three-variant funnel ANN with measured recall and latency tradeoffs"
+readme = "README.md"
 keywords = ["vector-search", "ann", "matryoshka", "coarse-to-fine", "agent-memory"]
 categories = ["algorithms", "data-structures", "science"]
 
