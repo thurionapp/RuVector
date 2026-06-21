@@ -1856,6 +1856,36 @@ impl RvfStore {
         self.options.dimension
     }
 
+    /// Iterate every live `(id, &vector)` pair currently materialized in the store.
+    ///
+    /// Lazy and zero-copy: borrows the in-memory vector store and yields one
+    /// entry per non-deleted vector, in arbitrary order. Deleted vectors (per
+    /// the deletion bitmap) are skipped, matching [`query`](Self::query)
+    /// visibility semantics.
+    ///
+    /// Motivation: `query` returns only `(id, distance)` ([`SearchResult`]),
+    /// and there was previously no public way to recover the vector payloads.
+    /// Downstream caches (e.g. an external `BackendAdapter` priming a quantized
+    /// index) need to read every `(id, vector)` pair without re-deriving it.
+    /// The reader existed internally but was `pub(crate)`.
+    pub fn iter_vectors(&self) -> impl Iterator<Item = (u64, &[f32])> + '_ {
+        let vectors = &self.vectors;
+        let deletion_bitmap = &self.deletion_bitmap;
+        vectors
+            .ids()
+            .filter(move |&&id| !deletion_bitmap.is_deleted(id))
+            .filter_map(move |&id| vectors.get(id).map(|v| (id, v)))
+    }
+
+    /// Collect every live `(id, vector)` pair into an owned `Vec`.
+    ///
+    /// Convenience over [`iter_vectors`](Self::iter_vectors) for callers that
+    /// want owned data. For very large stores, prefer `iter_vectors` and batch
+    /// at the call site to avoid materializing the whole set at once.
+    pub fn read_all_vectors(&self) -> Vec<(u64, Vec<f32>)> {
+        self.iter_vectors().map(|(id, v)| (id, v.to_vec())).collect()
+    }
+
     /// Get the file identity (lineage metadata) for this store.
     pub fn file_identity(&self) -> &FileIdentity {
         &self.file_identity
@@ -2497,6 +2527,46 @@ mod tests {
             v.push(((x >> 33) as f32) / (u32::MAX as f32) - 0.5);
         }
         v
+    }
+
+    #[test]
+    fn read_all_vectors_round_trips_and_excludes_deleted() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("read_all.rvf");
+
+        let options = RvfOptions {
+            dimension: 8,
+            metric: DistanceMetric::L2,
+            ..Default::default()
+        };
+        let mut store = RvfStore::create(&path, options).unwrap();
+
+        let ids = [10u64, 20, 30];
+        let vecs: Vec<Vec<f32>> = ids.iter().map(|&i| random_vector(8, i)).collect();
+        let vec_refs: Vec<&[f32]> = vecs.iter().map(|v| v.as_slice()).collect();
+        store.ingest_batch(&vec_refs, &ids, None).unwrap();
+
+        // read_all_vectors returns every ingested (id, vector) pair.
+        let mut got = store.read_all_vectors();
+        got.sort_by_key(|(id, _)| *id);
+        assert_eq!(got.len(), 3);
+        assert_eq!(got[0].0, 10);
+        assert_eq!(got[0].1, vecs[0]);
+        assert_eq!(got[2].0, 30);
+        assert_eq!(got[2].1, vecs[2]);
+
+        // iter_vectors yields the same ids, lazily and zero-copy.
+        let mut iter_ids: Vec<u64> = store.iter_vectors().map(|(id, _)| id).collect();
+        iter_ids.sort_unstable();
+        assert_eq!(iter_ids, vec![10, 20, 30]);
+
+        // Deleted vectors are excluded, matching query() visibility.
+        store.delete(&[20]).unwrap();
+        let after: Vec<u64> = store.iter_vectors().map(|(id, _)| id).collect();
+        assert!(!after.contains(&20));
+        assert_eq!(after.len(), 2);
+
+        store.close().unwrap();
     }
 
     #[test]
