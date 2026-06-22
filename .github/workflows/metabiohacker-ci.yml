@@ -1,0 +1,45 @@
+name: metabiohacker-ci
+
+# CI gates for the MetaBioHacker stack (ADR-0013/0017/0018/0022/0024):
+# frozen physics residual, mandatory pathology review, A/B-only claims,
+# verifiable ledgers, and the real-slice honesty gate.
+
+on:
+  push:
+    paths:
+      - "crates/sonic-ct/**"
+      - "crates/sonic-ct-wasm/**"
+      - "packages/metabiohacker/**"
+      - ".github/workflows/metabiohacker-ci.yml"
+  pull_request:
+    paths:
+      - "crates/sonic-ct/**"
+      - "crates/sonic-ct-wasm/**"
+      - "packages/metabiohacker/**"
+
+jobs:
+  rust-engine:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - name: sonic_ct tests
+        run: cd crates/sonic-ct && cargo test --release
+      - name: sonic_ct clippy (lib)
+        run: cd crates/sonic-ct && cargo clippy --release --lib -- -D warnings
+      - name: build wasm
+        run: bash scripts/build-sonic-ct-wasm.sh
+
+  metabiohacker-gates:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: install
+        run: cd packages/metabiohacker && npm ci || npm install
+      - name: CI gates + unit tests
+        run: cd packages/metabiohacker && npm test
