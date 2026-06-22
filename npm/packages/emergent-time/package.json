@@ -1,0 +1,50 @@
+{
+  "name": "@ruvector/emergent-time",
+  "version": "0.1.0",
+  "description": "Agentic Time: measure an AI agent's internal time and 7-state health from per-channel state deltas, in the browser, on the edge, or in Node — via a tiny WASM build of the emergent-time Rust crate.",
+  "type": "module",
+  "main": "pkg/emergent_time_wasm.js",
+  "module": "pkg/emergent_time_wasm.js",
+  "types": "pkg/emergent_time_wasm.d.ts",
+  "exports": {
+    ".": {
+      "types": "./pkg/emergent_time_wasm.d.ts",
+      "import": "./pkg/emergent_time_wasm.js",
+      "default": "./pkg/emergent_time_wasm.js"
+    },
+    "./wasm": "./pkg/emergent_time_wasm_bg.wasm"
+  },
+  "files": [
+    "pkg/emergent_time_wasm.js",
+    "pkg/emergent_time_wasm.d.ts",
+    "pkg/emergent_time_wasm_bg.wasm",
+    "pkg/emergent_time_wasm_bg.wasm.d.ts",
+    "README.md"
+  ],
+  "sideEffects": false,
+  "scripts": {
+    "build": "bash ./scripts/build.sh",
+    "test": "node ../../../crates/emergent-time-wasm/tests/smoke.mjs"
+  },
+  "keywords": [
+    "agentic-time",
+    "agents",
+    "ai-agents",
+    "observability",
+    "change-point",
+    "wasm",
+    "webassembly",
+    "emergent-time"
+  ],
+  "license": "MIT",
+  "author": "Ruvector Team",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ruvnet/ruvector"
+  },
+  "homepage": "https://github.com/ruvnet/ruvector",
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/",
+    "access": "public"
+  }
+}
