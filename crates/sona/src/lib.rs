@@ -45,6 +45,8 @@
 
 #![allow(missing_docs)]
 
+pub mod auto_tuner;
+pub mod darwin_guard;
 pub mod engine;
 pub mod ewc;
 pub mod loops;
