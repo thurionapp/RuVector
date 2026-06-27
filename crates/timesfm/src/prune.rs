@@ -51,7 +51,7 @@ use crate::model::PatchedTimeSeriesDecoder;
 use crate::Result;
 
 /// A prune/continue decision plus the evidence behind it.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct PruneDecision {
     /// `true` ⇒ the run is forecast to plateau *worse* than the viability
     /// threshold and should be killed; `false` ⇒ let it keep running.

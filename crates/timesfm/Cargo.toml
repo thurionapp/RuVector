@@ -28,15 +28,20 @@ required-features = ["candle"]
 name = "bench24"
 required-features = ["candle"]
 
+[[example]]
+name = "quant_bench"
+required-features = ["candle"]
+
 [features]
 default = []
 # Activates the candle inference path (hand-rolled decoder + VarBuilder
 # safetensors loading). Off by default so stock `cargo build --workspace`
 # stays light, mirroring ruvector-hailo's `cpu-fallback`/`candle` pattern.
 candle = ["candle-core", "candle-nn", "candle-transformers", "tokenizers"]
-# Acceleration backends (opt-in alongside `candle`).
-metal = ["candle-core/metal", "candle-nn/metal"]
-cuda = ["candle-core/cuda", "candle-nn/cuda"]
+# Acceleration backends. Each implies `candle` so `--features cuda` alone
+# compiles the numeric path on the GPU (no need to also pass `candle`).
+metal = ["candle", "candle-core/metal", "candle-nn/metal"]
+cuda = ["candle", "candle-core/cuda", "candle-nn/cuda"]
 # HuggingFace download path (google/timesfm-1.0-200m safetensors).
 hub = ["hf-hub"]
 

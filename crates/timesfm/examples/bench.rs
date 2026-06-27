@@ -5,7 +5,7 @@ use std::time::Instant;
 use timesfm::config::TimesfmConfig;
 use timesfm::model::PatchedTimeSeriesDecoder;
 fn main() -> anyhow::Result<()> {
-    let device = Device::Cpu;
+    let device = timesfm::select_device()?;
     let weights = std::env::var("TIMESFM_WEIGHTS")
         .unwrap_or("/tmp/timesfm-parity/timesfm.safetensors".into());
     let cfg = TimesfmConfig::timesfm_1p0_200m();
@@ -28,9 +28,10 @@ fn main() -> anyhow::Result<()> {
     let thr = std::thread::available_parallelism()
         .map(|x| x.get())
         .unwrap_or(0);
+    let dev_label = std::env::var("TIMESFM_DEVICE").unwrap_or_else(|_| "cpu".into());
     println!(
-        "TimesFM-200M decode(ctx=512,h=128) CPU: {:.2} ms/forecast  (mean of {} iters, {} threads)",
-        per, n, thr
+        "TimesFM-200M decode(ctx=512,h=128) [{}]: {:.2} ms/forecast  (mean of {} iters, {} threads)",
+        dev_label, per, n, thr
     );
     Ok(())
 }

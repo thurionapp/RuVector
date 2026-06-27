@@ -1,0 +1,40 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npx timesfm-harness*)",
+      "mcp__timesfm-harness__*",
+      "mcp__code_index__*",
+      "Bash(npm test*)",
+      "Bash(npm run*)",
+      "Bash(git diff*)",
+      "Bash(git status*)",
+      "Bash(git log*)"
+    ],
+    "deny": [
+      "Read(./.env)",
+      "Read(./.env.*)",
+      "Bash(git push*)",
+      "Bash(rm -rf*)"
+    ]
+  },
+  "mcpServers": {
+    "timesfm-harness": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "timesfm-harness@latest",
+        "mcp",
+        "start"
+      ]
+    },
+    "code_index": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "timesfm-harness@latest",
+        "mcp",
+        "index"
+      ]
+    }
+  }
+}

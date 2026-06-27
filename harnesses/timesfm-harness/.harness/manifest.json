@@ -1,0 +1,40 @@
+{
+  "schema": 1,
+  "generator": "0.1.0",
+  "template": "vertical:coding",
+  "template_version": "0.0.0",
+  "vars": {
+    "name": "timesfm-harness",
+    "description": "TimesFM 1.0 200M decoder-only time-series forecasting inference crate (Rust/candle) — engineering pod harness",
+    "host": "claude-code"
+  },
+  "hosts": [
+    "claude-code"
+  ],
+  "files": {
+    ".claude/commands/doctor.md": "2f1475fa0ed34729cb2ed9d6cecf29e99781da0a56afef133361e3ff0a17bb52",
+    ".claude/commands/review-diff.md": "2ab52f01487bfe67335f4de5193d7a6fb0f72f646411114613d8fa5da071ef2b",
+    ".claude/settings.json": "c6b680b7c2ce4c0c4125dbb36f34c99b826e7d75c355e780d988660880013a77",
+    ".claude/skills/plan-change/SKILL.md": "84e1c44ca264b999ebf80cd8fa0e5ebf554275bbd8023b1530ad053a44482e30",
+    ".claude-plugin/plugin.json": "4fb680b03453b73b7fff4050ec175cf30169d6b0d58941ce12dbf3292b2a26de",
+    "CLAUDE.md": "739055b4a227cffdd525fae343da2feb98f9fb8d06cd7f7d6139bac85caf7c20",
+    "README.md": "697541069108fde6038232cc4853d7ae0d22e3bc6283864444020bc48e309124",
+    "__tests__/smoke.test.ts": "99b3f65522fc146893f127af5795b4e165817edfaa70f313926979c9239bb76a",
+    "bin/cli.js": "0e8fba4c852cdb9544f7ddcb3e7936864f30ca53d5a75891ba933fede7902840",
+    "package.json": "11859320c6a86ac9637316325bfb65fdfaeca3ffa9d0839fb1c831b5e7601eb5",
+    "src/agents/architect.ts": "b07d7dd64b5ecf406ee6ccce545f44b367f1eb699f7c10c5884ca9f4c59b27b9",
+    "src/agents/implementer.ts": "705f008d7d83af785b306895f7abaa6cbba9d6f9e95cfe475648d499684c093d",
+    "src/agents/reviewer.ts": "476725f65d80d0e603b615e4d432fe6d0c058b7dc49ce484a7b62ee5edba5bc4",
+    "src/agents/test-writer.ts": "53f3ac9d344694c1a058586d90bb66af1478b31ef69d8bb44c20a09cf9215581",
+    "src/init.ts": "e32e046b54f72088962b4cb840811bb931752da512a9386818f6ba4b1354a76c",
+    "tsconfig.json": "8b4e730a1aa39162ac574455d7a98e1881f5313ca80ffe503b9652dcf0c76b9d",
+    "vitest.config.ts": "e9e94875611ab1cd602c1f6923902c2dab7953a75ac022962973639d1937587a",
+    "LICENSE": "a471cd13d1c9d05bd3104774af74facd230076758ee25320e549fe0de08a376a",
+    ".claude/skills/evolve/SKILL.md": "298f66d6e5d2cf2c5c6c6f1bce193b75849e092e455aa5086a03428ffe766902"
+  },
+  "generated_at": "2026-06-25T20:42:21.001Z",
+  "meta": {
+    "surface": "cli",
+    "kernel_version": "0.1.2"
+  }
+}

@@ -59,6 +59,32 @@ pub use model::{
     TimesFMAttention, TimesFMDecoderLayer, TransformerMLP,
 };
 
+/// Select the compute device from the `TIMESFM_DEVICE` env var
+/// (`cpu` | `cuda` | `metal`), defaulting to CPU.
+///
+/// `cuda`/`metal` only resolve to a real accelerator when the corresponding
+/// crate feature is enabled (`--features cuda` / `--features metal`); otherwise
+/// the request logs a notice and falls back to CPU so examples/benches still
+/// run. This keeps every example, bench, test, and downstream crate selecting
+/// the device the same way instead of hardcoding `Device::Cpu`.
+#[cfg(feature = "candle")]
+pub fn select_device() -> candle_core::Result<candle_core::Device> {
+    use candle_core::Device;
+    match std::env::var("TIMESFM_DEVICE").ok().as_deref() {
+        #[cfg(feature = "cuda")]
+        Some("cuda") => Device::new_cuda(0),
+        #[cfg(feature = "metal")]
+        Some("metal") => Device::new_metal(0),
+        Some(other @ ("cuda" | "metal")) => {
+            eprintln!(
+                "TIMESFM_DEVICE={other} requested but the `{other}` feature is not enabled; using CPU"
+            );
+            Ok(Device::Cpu)
+        }
+        _ => Ok(Device::Cpu),
+    }
+}
+
 /// Crate-level error type. Wraps candle errors when the `candle` feature is on.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
