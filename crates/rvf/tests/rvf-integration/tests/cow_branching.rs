@@ -3,7 +3,7 @@
 //! Tests the core branching flow: creating a base store, deriving a child,
 //! verifying COW statistics, write coalescing, and parent immutability.
 
-use rvf_runtime::options::{DistanceMetric, RvfOptions};
+use rvf_runtime::options::{DistanceMetric, QueryOptions, RvfOptions};
 use rvf_runtime::RvfStore;
 use tempfile::TempDir;
 
@@ -381,4 +381,121 @@ fn branch_membership_filter_excludes_deleted() {
     base.close().unwrap();
 
     println!("PASS: branch_membership_filter_excludes_deleted");
+}
+
+// ===========================================================================
+// TEST 9: branch_query_reads_through_to_parent  (the COW-queryability fix)
+// ===========================================================================
+
+/// The core regression for the "COW branch is not queryable" bug.
+///
+/// Builds a 1k-vector base, branches a COW child, applies a few edits, then
+/// asserts:
+///   1. a query for a *base* vector returns it (parent read-through works,
+///      even from a child with zero local edits);
+///   2. a query for an *edited* vector returns the child's value (override
+///      wins over the inherited parent vector on an id collision);
+///   3. a brand-new vector added to the child is queryable;
+///   4. the branch file stays small — a COW delta, not a full copy.
+#[test]
+fn branch_query_reads_through_to_parent() {
+    let dir = TempDir::new().unwrap();
+    let base_path = dir.path().join("base_rt.rvf");
+    let child_path = dir.path().join("child_rt.rvf");
+    let dim: u16 = 16;
+    let n: u64 = 1000;
+
+    // Build a 1k-vector base with contiguous ids 0..n.
+    let mut base = RvfStore::create(&base_path, make_options(dim)).unwrap();
+    let vectors: Vec<Vec<f32>> = (0..n).map(|i| random_vector(dim as usize, i)).collect();
+    let refs: Vec<&[f32]> = vectors.iter().map(|v| v.as_slice()).collect();
+    let ids: Vec<u64> = (0..n).collect();
+    base.ingest_batch(&refs, &ids, None).unwrap();
+    base.freeze().unwrap(); // immutable parent (correct COW usage)
+
+    // Branch a COW child.
+    let mut child = base.branch(&child_path).unwrap();
+    let opts = QueryOptions::default();
+
+    // (1) Empty-child read-through: query for a known BASE vector. Before
+    // the fix this returned nothing (only the child's own edits were
+    // searchable, and the child has none yet).
+    let base_id: u64 = 123;
+    let hits = child.query(&vectors[base_id as usize], 5, &opts).unwrap();
+    assert!(
+        !hits.is_empty(),
+        "COW child must return parent results via read-through"
+    );
+    assert_eq!(
+        hits[0].id, base_id,
+        "read-through must return the matching base vector as nearest"
+    );
+    assert!(
+        hits[0].distance < 1e-3,
+        "exact base vector should match at ~0 distance, got {}",
+        hits[0].distance
+    );
+
+    // (2) Override: re-ingest an existing base id in the child with a new
+    // value. A query for the NEW value must return that id (child wins).
+    let override_id: u64 = 200;
+    let new_val = random_vector(dim as usize, 999_999);
+    child
+        .ingest_batch(&[new_val.as_slice()], &[override_id], None)
+        .unwrap();
+
+    let hits = child.query(&new_val, 5, &opts).unwrap();
+    assert_eq!(
+        hits[0].id, override_id,
+        "child override must win over the inherited parent vector"
+    );
+    assert!(
+        hits[0].distance < 1e-3,
+        "override exact match should be ~0, got {}",
+        hits[0].distance
+    );
+
+    // The OLD parent value of override_id is no longer present, so if that
+    // id appears at all it must not match its old value at ~0 distance.
+    let old_val = &vectors[override_id as usize];
+    let hits = child.query(old_val, 5, &opts).unwrap();
+    if let Some(h) = hits.iter().find(|h| h.id == override_id) {
+        assert!(
+            h.distance > 1e-3,
+            "overridden id must not still match its OLD value at ~0"
+        );
+    }
+
+    // (3) A brand-new vector added to the child is queryable.
+    let new_id: u64 = 5000;
+    let added = random_vector(dim as usize, 424_242);
+    child
+        .ingest_batch(&[added.as_slice()], &[new_id], None)
+        .unwrap();
+    let hits = child.query(&added, 5, &opts).unwrap();
+    assert_eq!(
+        hits[0].id, new_id,
+        "newly added child vector must be queryable"
+    );
+
+    // Base vector is still reachable after the child's edits.
+    let hits = child.query(&vectors[base_id as usize], 3, &opts).unwrap();
+    assert_eq!(
+        hits[0].id, base_id,
+        "base vector must remain reachable after child edits"
+    );
+
+    // (4) Branch stays small: a COW delta, not a full copy.
+    child.close().unwrap();
+    base.close().unwrap();
+    let base_size = std::fs::metadata(&base_path).unwrap().len();
+    let child_size = std::fs::metadata(&child_path).unwrap().len();
+    assert!(
+        child_size.saturating_mul(10) < base_size,
+        "COW branch ({child_size} B) must be far smaller than base ({base_size} B)"
+    );
+
+    println!(
+        "PASS: branch_query_reads_through_to_parent -- base={base_size} B, child={child_size} B"
+    );
 }

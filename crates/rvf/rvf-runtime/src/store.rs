@@ -89,6 +89,12 @@ pub struct RvfStore {
     /// Same single-builder gate as `index_building`, for the RaBitQ code
     /// book (its lazy build is an O(N) scan + encode).
     rabitq_building: AtomicBool,
+    /// Lazily-opened, read-only handle to the parent store, used for COW
+    /// read-through queries (parent ∪ child-edits). `None` for root stores
+    /// and until the first query on a COW child resolves it from
+    /// [`Self::parent_path`]. Boxed to break the recursive type and guarded
+    /// by a `Mutex` so `query(&self)` can populate it lazily.
+    parent_store: Mutex<Option<Box<RvfStore>>>,
 }
 
 /// Clears an `AtomicBool` on drop, so a panicking index build can never
@@ -153,6 +159,7 @@ impl RvfStore {
             index_building: AtomicBool::new(false),
             rabitq: Mutex::new(None),
             rabitq_building: AtomicBool::new(false),
+            parent_store: Mutex::new(None),
         };
 
         store.write_manifest()?;
@@ -207,6 +214,7 @@ impl RvfStore {
             index_building: AtomicBool::new(false),
             rabitq: Mutex::new(None),
             rabitq_building: AtomicBool::new(false),
+            parent_store: Mutex::new(None),
         };
 
         store.boot()?;
@@ -257,6 +265,7 @@ impl RvfStore {
             index_building: AtomicBool::new(false),
             rabitq: Mutex::new(None),
             rabitq_building: AtomicBool::new(false),
+            parent_store: Mutex::new(None),
         };
 
         store.boot()?;
@@ -434,7 +443,11 @@ impl RvfStore {
             return Err(err(ErrorCode::DimensionMismatch));
         }
 
-        if self.vectors.len() == 0 {
+        // A COW child can have zero *local* vectors yet still resolve
+        // results from its parent via read-through, so only short-circuit
+        // when there is genuinely nothing to scan (no local data AND not a
+        // COW child).
+        if self.vectors.len() == 0 && self.cow_engine.is_none() {
             return Ok((Vec::new(), false));
         }
 
@@ -654,7 +667,10 @@ impl RvfStore {
         };
 
         // Scan the contiguous slab in ordinal order (cache-friendly: rows
-        // are adjacent in memory, no per-vector pointer chase).
+        // are adjacent in memory, no per-vector pointer chase). For a COW
+        // child this slab holds only the child's own edits/overrides; the
+        // inherited parent vectors are merged in by the read-through scan
+        // below.
         for (vec_id, stored_vec) in self.vectors.iter() {
             if self.deletion_bitmap.is_deleted(vec_id) {
                 continue;
@@ -665,17 +681,15 @@ impl RvfStore {
                 }
             }
             let dist = compute_distance(vector, stored_vec, &self.options.metric, query_norm_sq);
-            if heap.len() < k {
-                heap.push((OrderedFloat(dist), vec_id));
-            } else if let Some(&(OrderedFloat(worst), worst_id)) = heap.peek() {
-                // Tie-break equal distances by smaller id so the selected
-                // k-set is independent of storage iteration order.
-                if dist < worst || (dist == worst && vec_id < worst_id) {
-                    heap.pop();
-                    heap.push((OrderedFloat(dist), vec_id));
-                }
-            }
+            heap_consider(&mut heap, k, dist, vec_id);
         }
+
+        // COW read-through: a branch created via [`Self::branch`] inherits
+        // its parent's vectors. Merge in every inherited parent vector that
+        // the child has neither overridden (re-ingested locally) nor
+        // deleted, so a query for a *base* vector returns it (parent ∪
+        // child-edits, child wins on id collision).
+        self.cow_scan_parent(vector, query_norm_sq, k, options, &mut heap);
 
         // Drain the max-heap into sorted results (closest first).
         let mut results: Vec<SearchResult> = heap
@@ -693,6 +707,94 @@ impl RvfStore {
                 .then_with(|| a.id.cmp(&b.id))
         });
         results
+    }
+
+    /// COW read-through scan: merge the parent's inherited vectors into the
+    /// exact-scan result heap.
+    ///
+    /// A store created via [`Self::branch`] holds only its own edits in
+    /// `self.vectors` while the parent's vectors are inherited through the
+    /// [`MembershipFilter`]. Without this scan a query on the child would
+    /// only ever see the child's edits (the bug this fixes). Here we open
+    /// the parent read-only (lazily, cached for subsequent queries) and add
+    /// each inherited vector that the child has **not** overridden or
+    /// deleted, giving the git-like `parent ∪ child-edits` semantics where
+    /// the child wins on an id collision.
+    ///
+    /// This is the EXACT-scan (flat) read-through slice. Read-through across
+    /// the COW boundary for the HNSW / RaBitQ index paths is deliberately
+    /// out of scope (those paths are already disabled for COW children by
+    /// [`Self::index_eligible`] / [`Self::rabitq_eligible`], so queries fall
+    /// back here) and is tracked as a follow-up.
+    ///
+    /// No-op for root stores (no `cow_engine` / `membership_filter` /
+    /// `parent_path`). If the parent file cannot be opened the child simply
+    /// returns its own results rather than failing the query.
+    fn cow_scan_parent(
+        &self,
+        vector: &[f32],
+        query_norm_sq: f32,
+        k: usize,
+        options: &QueryOptions,
+        heap: &mut BinaryHeap<(OrderedFloat, u64)>,
+    ) {
+        // Only COW children (created by `branch`) read through to a parent.
+        if self.cow_engine.is_none() {
+            return;
+        }
+        let Some(filter) = self.membership_filter.as_ref() else {
+            return;
+        };
+        let Some(parent_path) = self.parent_path.as_ref() else {
+            return;
+        };
+
+        // Lazily open (and cache) a read-only handle to the parent. A
+        // read-only open takes no writer lock, so it never contends with a
+        // parent still open for writing in the same process.
+        let mut guard = self.parent_store.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.is_none() {
+            match RvfStore::open_readonly(parent_path) {
+                Ok(parent) => *guard = Some(Box::new(parent)),
+                // Parent unavailable: fall back to child-only results.
+                Err(_) => return,
+            }
+        }
+        let parent = match guard.as_ref() {
+            Some(p) => p,
+            None => return,
+        };
+
+        // Dimension guard: a mismatched parent would corrupt distances.
+        if parent.options.dimension != self.options.dimension {
+            return;
+        }
+
+        for (vec_id, stored_vec) in parent.vectors.iter() {
+            // Only vectors inherited at branch time are visible.
+            if !filter.contains(vec_id) {
+                continue;
+            }
+            // Child override wins: skip parent copy if re-ingested locally.
+            if self.vectors.get(vec_id).is_some() {
+                continue;
+            }
+            // Deleted in the child (tombstone) hides the inherited vector.
+            if self.deletion_bitmap.is_deleted(vec_id) {
+                continue;
+            }
+            // Defensive: also respect the parent's own tombstones.
+            if parent.deletion_bitmap.is_deleted(vec_id) {
+                continue;
+            }
+            if let Some(ref filter_expr) = options.filter {
+                if !filter::evaluate(filter_expr, vec_id, &parent.metadata) {
+                    continue;
+                }
+            }
+            let dist = compute_distance(vector, stored_vec, &self.options.metric, query_norm_sq);
+            heap_consider(heap, k, dist, vec_id);
+        }
     }
 
     /// Query the store and return a full QualityEnvelope (ADR-033 §2.4).
@@ -1945,8 +2047,14 @@ impl RvfStore {
             bytes_per_vec,
         ));
 
-        // Initialize membership filter with all parent vectors visible
-        let mut filter = MembershipFilter::new_include(total_vecs);
+        // Initialize membership filter with all parent vectors visible.
+        // Size the bitmap by max id + 1 (not the count) so sparse / non-
+        // contiguous ids are representable — `MembershipFilter::add` drops
+        // any id >= capacity, which would silently make those parent
+        // vectors invisible to read-through.
+        let max_id = self.vectors.ids().copied().max().unwrap_or(0);
+        let filter_capacity = max_id.saturating_add(1).max(total_vecs);
+        let mut filter = MembershipFilter::new_include(filter_capacity);
         for &vid in self.vectors.ids() {
             if !self.deletion_bitmap.is_deleted(vid) {
                 filter.add(vid);
@@ -2069,6 +2177,7 @@ impl RvfStore {
             index_building: AtomicBool::new(false),
             rabitq: Mutex::new(None),
             rabitq_building: AtomicBool::new(false),
+            parent_store: Mutex::new(None),
         };
 
         store.write_manifest()?;
@@ -2356,6 +2465,25 @@ fn compute_distance(a: &[f32], b: &[f32], metric: &DistanceMetric, a_norm_sq: f3
             } else {
                 1.0 - dot / denom
             }
+        }
+    }
+}
+
+/// Offer a `(distance, id)` candidate to a bounded max-heap of size `k`.
+///
+/// Keeps the `k` closest candidates seen so far. On a full heap a candidate
+/// is admitted when it is strictly closer than the current farthest, or ties
+/// the farthest distance with a smaller id (deterministic tie-break, so the
+/// selected k-set is independent of scan order across the local and
+/// COW-parent passes).
+#[inline]
+fn heap_consider(heap: &mut BinaryHeap<(OrderedFloat, u64)>, k: usize, dist: f32, vec_id: u64) {
+    if heap.len() < k {
+        heap.push((OrderedFloat(dist), vec_id));
+    } else if let Some(&(OrderedFloat(worst), worst_id)) = heap.peek() {
+        if dist < worst || (dist == worst && vec_id < worst_id) {
+            heap.pop();
+            heap.push((OrderedFloat(dist), vec_id));
         }
     }
 }

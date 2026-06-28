@@ -764,6 +764,36 @@ impl RvfDatabase {
         })
     }
 
+    /// Create a **queryable** copy-on-write branch of this store.
+    ///
+    /// Unlike [`derive`](Self::derive) — which records lineage only and
+    /// produces a child that can see just its own edits — `branch` wires a
+    /// real COW engine and membership filter so the child inherits the
+    /// parent's vectors. Querying the child returns `parent ∪ child-edits`:
+    /// the child's re-ingested vectors override the parent on an id
+    /// collision, and deletes in the child hide inherited vectors. The
+    /// branch stores only its own edits on disk, so it stays small
+    /// regardless of the parent's size.
+    ///
+    /// The parent should be frozen (see [`freeze`](Self::freeze)) before
+    /// branching to guarantee immutability of the inherited data.
+    #[napi]
+    pub fn branch(&self, child_path: String) -> Result<RvfDatabase> {
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|_| napi::Error::from_reason("Lock poisoned"))?;
+        let store = guard
+            .as_ref()
+            .ok_or_else(|| napi::Error::from_reason("Store is closed"))?;
+
+        let child_store = store.branch(Path::new(&child_path)).map_err(map_rvf_err)?;
+
+        Ok(RvfDatabase {
+            inner: Mutex::new(Some(child_store)),
+        })
+    }
+
     // ── Kernel / eBPF methods ────────────────────────────────────────
 
     /// Embed a kernel image into this RVF file.
