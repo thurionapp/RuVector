@@ -13,6 +13,10 @@ categories = ["algorithms", "science"]
 publish = false
 
 [[bin]]
+name = "sift1m-bench"
+path = "src/bin/sift1m_bench.rs"
+
+[[bin]]
 name = "sota-ann"
 path = "src/bin/sota_ann.rs"
 
@@ -46,7 +50,7 @@ path = "src/lib.rs"
 
 [dependencies]
 # Core RuVector crates under test
-ruvector-core = { version = "2.0", path = "../ruvector-core", default-features = false, features = ["storage", "hnsw", "parallel", "simd"] }
+ruvector-core = { version = "2.0", path = "../ruvector-core", default-features = false, features = ["storage", "hnsw", "parallel", "simd", "simd-avx512"] }
 ruvector-rabitq = { path = "../ruvector-rabitq" }
 ruvector-diskann = { path = "../ruvector-diskann", optional = true }
 

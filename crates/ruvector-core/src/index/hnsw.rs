@@ -22,12 +22,25 @@ impl DistanceFn {
 }
 
 impl Distance<f32> for DistanceFn {
+    #[inline(always)]
     fn eval(&self, a: &[f32], b: &[f32]) -> f32 {
-        // hnsw_rs asserts `dist_to_ref >= 0` in its search loop.  Clamp any
-        // tiny negative values caused by floating-point rounding (e.g. cosine
-        // distance between two nearly-identical normalised vectors can be
-        // marginally below zero).  f32::MAX is the safe sentinel for errors.
-        distance(a, b, self.metric).unwrap_or(f32::MAX).max(0.0)
+        // Bypass the simsimd/Result-overhead path and call our hand-written
+        // SIMD kernels directly.  hnsw_rs asserts dist >= 0 in its search
+        // loop, so clamp any floating-point rounding below zero.
+        use crate::simd_intrinsics;
+        match self.metric {
+            DistanceMetric::Euclidean => simd_intrinsics::euclidean_distance_simd(a, b),
+            DistanceMetric::Cosine => {
+                // cosine_similarity_simd returns dot/(|a||b|); HNSW needs
+                // cosine DISTANCE = 1 - sim, clamped to 0.
+                (1.0_f32 - simd_intrinsics::cosine_similarity_simd(a, b)).max(0.0)
+            }
+            DistanceMetric::DotProduct => {
+                // Negate for minimization; clamp per hnsw_rs assertion.
+                (-simd_intrinsics::dot_product_simd(a, b)).max(0.0)
+            }
+            DistanceMetric::Manhattan => simd_intrinsics::manhattan_distance_simd(a, b),
+        }
     }
 }
 
@@ -355,11 +368,25 @@ impl VectorIndex for HnswIndex {
         // Update next_idx
         inner.next_idx += entries.len();
 
-        // Insert into HNSW sequentially
-        // Note: Using sequential insertion to avoid Send requirements with RwLock guard
-        // For large batches, consider restructuring to use hnsw_rs parallel_insert
-        for (_id, idx, vector) in &data_with_ids {
-            inner.hnsw.insert_data(vector, *idx);
+        // For large batches (>=PARALLEL_THRESHOLD), use hnsw_rs parallel
+        // insert (rayon-based) to cut build time.  Below this threshold,
+        // sequential insert maintains better graph connectivity — parallel
+        // workers can miss each other's in-flight inserts, producing fewer
+        // optimal neighbors and increasing search latency on small indexes.
+        //
+        // Rule of thumb from hnsw_rs: parallel is efficient only when
+        // n_inserts >= 1000 * num_threads.  We conservatively gate at 10 K.
+        const PARALLEL_THRESHOLD: usize = 10_000;
+        if data_with_ids.len() >= PARALLEL_THRESHOLD {
+            let datas: Vec<(&[f32], usize)> = data_with_ids
+                .iter()
+                .map(|(_id, idx, vector)| (vector.as_slice(), *idx))
+                .collect();
+            inner.hnsw.parallel_insert_slice(&datas);
+        } else {
+            for (_id, idx, vector) in &data_with_ids {
+                inner.hnsw.insert_data(vector, *idx);
+            }
         }
 
         // Store mappings

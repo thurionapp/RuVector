@@ -55,6 +55,7 @@
     "body-parser": "^2.2.1"
   },
   "dependencies": {
-    "@claude-flow/memory": "^3.0.0-alpha.7"
+    "@claude-flow/memory": "^3.0.0-alpha.7",
+    "hnswlib-node": "^3.0.0"
   }
 }

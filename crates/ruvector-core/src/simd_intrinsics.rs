@@ -195,30 +195,67 @@ unsafe fn euclidean_distance_avx2_fma_impl(a: &[f32], b: &[f32]) -> f32 {
 // AVX-512 implementations for x86_64 (Intel Ice Lake, Sapphire Rapids, AMD Zen 4+)
 // ============================================================================
 
-/// AVX-512 euclidean distance - processes 16 floats per iteration
+/// AVX-512 euclidean distance - 4-accumulator version for ILP
+/// Processes 64 floats per iteration (4×16) to hide 4-cycle FMA latency on Zen 4/5.
+/// For 384-dim vectors: 384/64 = 6 exact iterations with no scalar tail.
 #[cfg(all(target_arch = "x86_64", feature = "simd-avx512"))]
 #[target_feature(enable = "avx512f")]
 unsafe fn euclidean_distance_avx512_impl(a: &[f32], b: &[f32]) -> f32 {
     assert_eq!(a.len(), b.len(), "Input arrays must have the same length");
 
     let len = a.len();
-    let mut sum = _mm512_setzero_ps();
+    // 4 independent accumulators hide the 4-cycle FMA latency
+    let mut sum0 = _mm512_setzero_ps();
+    let mut sum1 = _mm512_setzero_ps();
+    let mut sum2 = _mm512_setzero_ps();
+    let mut sum3 = _mm512_setzero_ps();
 
-    // Process 16 floats at a time
-    let chunks = len / 16;
+    // Process 64 floats at a time (4 × 16)
+    let chunks = len / 64;
     for i in 0..chunks {
-        let idx = i * 16;
+        let idx = i * 64;
+        let va0 = _mm512_loadu_ps(a.as_ptr().add(idx));
+        let vb0 = _mm512_loadu_ps(b.as_ptr().add(idx));
+        let diff0 = _mm512_sub_ps(va0, vb0);
+        sum0 = _mm512_fmadd_ps(diff0, diff0, sum0);
+
+        let va1 = _mm512_loadu_ps(a.as_ptr().add(idx + 16));
+        let vb1 = _mm512_loadu_ps(b.as_ptr().add(idx + 16));
+        let diff1 = _mm512_sub_ps(va1, vb1);
+        sum1 = _mm512_fmadd_ps(diff1, diff1, sum1);
+
+        let va2 = _mm512_loadu_ps(a.as_ptr().add(idx + 32));
+        let vb2 = _mm512_loadu_ps(b.as_ptr().add(idx + 32));
+        let diff2 = _mm512_sub_ps(va2, vb2);
+        sum2 = _mm512_fmadd_ps(diff2, diff2, sum2);
+
+        let va3 = _mm512_loadu_ps(a.as_ptr().add(idx + 48));
+        let vb3 = _mm512_loadu_ps(b.as_ptr().add(idx + 48));
+        let diff3 = _mm512_sub_ps(va3, vb3);
+        sum3 = _mm512_fmadd_ps(diff3, diff3, sum3);
+    }
+
+    // Tree-reduce accumulators
+    let sum01 = _mm512_add_ps(sum0, sum1);
+    let sum23 = _mm512_add_ps(sum2, sum3);
+    let mut sum = _mm512_add_ps(sum01, sum23);
+
+    // Handle remaining 16-float chunks
+    let remaining_start = chunks * 64;
+    let remaining_chunks = (len - remaining_start) / 16;
+    for i in 0..remaining_chunks {
+        let idx = remaining_start + i * 16;
         let va = _mm512_loadu_ps(a.as_ptr().add(idx));
         let vb = _mm512_loadu_ps(b.as_ptr().add(idx));
         let diff = _mm512_sub_ps(va, vb);
         sum = _mm512_fmadd_ps(diff, diff, sum);
     }
 
-    // Horizontal sum using AVX-512 reduction
     let mut total = _mm512_reduce_add_ps(sum);
 
-    // Handle remaining elements (0-15 elements)
-    for i in (chunks * 16)..len {
+    // Scalar tail (0–15 elements)
+    let scalar_start = remaining_start + remaining_chunks * 16;
+    for i in scalar_start..len {
         let diff = a[i] - b[i];
         total += diff * diff;
     }
@@ -226,18 +263,47 @@ unsafe fn euclidean_distance_avx512_impl(a: &[f32], b: &[f32]) -> f32 {
     total.sqrt()
 }
 
-/// AVX-512 dot product - processes 16 floats per iteration
+/// AVX-512 dot product - 4-accumulator version for ILP
+/// Processes 64 floats per iteration (4×16) to hide 4-cycle FMA latency on Zen 4/5.
 #[cfg(all(target_arch = "x86_64", feature = "simd-avx512"))]
 #[target_feature(enable = "avx512f")]
 unsafe fn dot_product_avx512_impl(a: &[f32], b: &[f32]) -> f32 {
     assert_eq!(a.len(), b.len(), "Input arrays must have the same length");
 
     let len = a.len();
-    let mut sum = _mm512_setzero_ps();
+    let mut sum0 = _mm512_setzero_ps();
+    let mut sum1 = _mm512_setzero_ps();
+    let mut sum2 = _mm512_setzero_ps();
+    let mut sum3 = _mm512_setzero_ps();
 
-    let chunks = len / 16;
+    let chunks = len / 64;
     for i in 0..chunks {
-        let idx = i * 16;
+        let idx = i * 64;
+        let va0 = _mm512_loadu_ps(a.as_ptr().add(idx));
+        let vb0 = _mm512_loadu_ps(b.as_ptr().add(idx));
+        sum0 = _mm512_fmadd_ps(va0, vb0, sum0);
+
+        let va1 = _mm512_loadu_ps(a.as_ptr().add(idx + 16));
+        let vb1 = _mm512_loadu_ps(b.as_ptr().add(idx + 16));
+        sum1 = _mm512_fmadd_ps(va1, vb1, sum1);
+
+        let va2 = _mm512_loadu_ps(a.as_ptr().add(idx + 32));
+        let vb2 = _mm512_loadu_ps(b.as_ptr().add(idx + 32));
+        sum2 = _mm512_fmadd_ps(va2, vb2, sum2);
+
+        let va3 = _mm512_loadu_ps(a.as_ptr().add(idx + 48));
+        let vb3 = _mm512_loadu_ps(b.as_ptr().add(idx + 48));
+        sum3 = _mm512_fmadd_ps(va3, vb3, sum3);
+    }
+
+    let sum01 = _mm512_add_ps(sum0, sum1);
+    let sum23 = _mm512_add_ps(sum2, sum3);
+    let mut sum = _mm512_add_ps(sum01, sum23);
+
+    let remaining_start = chunks * 64;
+    let remaining_chunks = (len - remaining_start) / 16;
+    for i in 0..remaining_chunks {
+        let idx = remaining_start + i * 16;
         let va = _mm512_loadu_ps(a.as_ptr().add(idx));
         let vb = _mm512_loadu_ps(b.as_ptr().add(idx));
         sum = _mm512_fmadd_ps(va, vb, sum);
@@ -245,40 +311,70 @@ unsafe fn dot_product_avx512_impl(a: &[f32], b: &[f32]) -> f32 {
 
     let mut total = _mm512_reduce_add_ps(sum);
 
-    for i in (chunks * 16)..len {
+    let scalar_start = remaining_start + remaining_chunks * 16;
+    for i in scalar_start..len {
         total += a[i] * b[i];
     }
 
     total
 }
 
-/// AVX-512 cosine similarity - processes 16 floats per iteration
+/// AVX-512 cosine similarity - 2-accumulator-per-component version for ILP
+/// Uses 6 ZMM registers (dot0/dot1, na0/na1, nb0/nb1) to hide 4-cycle FMA latency.
+/// Processes 32 floats per iteration (2×16) on Zen 4/5.
 #[cfg(all(target_arch = "x86_64", feature = "simd-avx512"))]
 #[target_feature(enable = "avx512f")]
 unsafe fn cosine_similarity_avx512_impl(a: &[f32], b: &[f32]) -> f32 {
     assert_eq!(a.len(), b.len(), "Input arrays must have the same length");
 
     let len = a.len();
-    let mut dot = _mm512_setzero_ps();
-    let mut norm_a = _mm512_setzero_ps();
-    let mut norm_b = _mm512_setzero_ps();
+    let mut dot0 = _mm512_setzero_ps();
+    let mut dot1 = _mm512_setzero_ps();
+    let mut norm_a0 = _mm512_setzero_ps();
+    let mut norm_a1 = _mm512_setzero_ps();
+    let mut norm_b0 = _mm512_setzero_ps();
+    let mut norm_b1 = _mm512_setzero_ps();
 
-    let chunks = len / 16;
+    // Process 32 floats at a time (2 × 16)
+    let chunks = len / 32;
     for i in 0..chunks {
-        let idx = i * 16;
-        let va = _mm512_loadu_ps(a.as_ptr().add(idx));
-        let vb = _mm512_loadu_ps(b.as_ptr().add(idx));
+        let idx = i * 32;
+        let va0 = _mm512_loadu_ps(a.as_ptr().add(idx));
+        let vb0 = _mm512_loadu_ps(b.as_ptr().add(idx));
+        dot0 = _mm512_fmadd_ps(va0, vb0, dot0);
+        norm_a0 = _mm512_fmadd_ps(va0, va0, norm_a0);
+        norm_b0 = _mm512_fmadd_ps(vb0, vb0, norm_b0);
 
-        dot = _mm512_fmadd_ps(va, vb, dot);
-        norm_a = _mm512_fmadd_ps(va, va, norm_a);
-        norm_b = _mm512_fmadd_ps(vb, vb, norm_b);
+        let va1 = _mm512_loadu_ps(a.as_ptr().add(idx + 16));
+        let vb1 = _mm512_loadu_ps(b.as_ptr().add(idx + 16));
+        dot1 = _mm512_fmadd_ps(va1, vb1, dot1);
+        norm_a1 = _mm512_fmadd_ps(va1, va1, norm_a1);
+        norm_b1 = _mm512_fmadd_ps(vb1, vb1, norm_b1);
     }
 
-    let mut dot_sum = _mm512_reduce_add_ps(dot);
-    let mut norm_a_sum = _mm512_reduce_add_ps(norm_a);
-    let mut norm_b_sum = _mm512_reduce_add_ps(norm_b);
+    // Tree-reduce each component
+    let mut dot_v = _mm512_add_ps(dot0, dot1);
+    let mut na_v = _mm512_add_ps(norm_a0, norm_a1);
+    let mut nb_v = _mm512_add_ps(norm_b0, norm_b1);
 
-    for i in (chunks * 16)..len {
+    // Handle remaining 16-float chunks
+    let remaining_start = chunks * 32;
+    let remaining_chunks = (len - remaining_start) / 16;
+    for i in 0..remaining_chunks {
+        let idx = remaining_start + i * 16;
+        let va = _mm512_loadu_ps(a.as_ptr().add(idx));
+        let vb = _mm512_loadu_ps(b.as_ptr().add(idx));
+        dot_v = _mm512_fmadd_ps(va, vb, dot_v);
+        na_v = _mm512_fmadd_ps(va, va, na_v);
+        nb_v = _mm512_fmadd_ps(vb, vb, nb_v);
+    }
+
+    let mut dot_sum = _mm512_reduce_add_ps(dot_v);
+    let mut norm_a_sum = _mm512_reduce_add_ps(na_v);
+    let mut norm_b_sum = _mm512_reduce_add_ps(nb_v);
+
+    let scalar_start = remaining_start + remaining_chunks * 16;
+    for i in scalar_start..len {
         dot_sum += a[i] * b[i];
         norm_a_sum += a[i] * a[i];
         norm_b_sum += b[i] * b[i];
@@ -287,28 +383,61 @@ unsafe fn cosine_similarity_avx512_impl(a: &[f32], b: &[f32]) -> f32 {
     dot_sum / (norm_a_sum.sqrt() * norm_b_sum.sqrt())
 }
 
-/// AVX-512 Manhattan distance - processes 16 floats per iteration
+/// AVX-512 Manhattan distance - 4-accumulator version for ILP
+/// Processes 64 floats per iteration (4×16) to hide add-latency on Zen 4/5.
 #[cfg(all(target_arch = "x86_64", feature = "simd-avx512"))]
 #[target_feature(enable = "avx512f")]
 unsafe fn manhattan_distance_avx512_impl(a: &[f32], b: &[f32]) -> f32 {
     assert_eq!(a.len(), b.len(), "Input arrays must have the same length");
 
     let len = a.len();
-    let mut sum = _mm512_setzero_ps();
+    let mut sum0 = _mm512_setzero_ps();
+    let mut sum1 = _mm512_setzero_ps();
+    let mut sum2 = _mm512_setzero_ps();
+    let mut sum3 = _mm512_setzero_ps();
 
-    let chunks = len / 16;
+    let chunks = len / 64;
     for i in 0..chunks {
-        let idx = i * 16;
+        let idx = i * 64;
+        let va0 = _mm512_loadu_ps(a.as_ptr().add(idx));
+        let vb0 = _mm512_loadu_ps(b.as_ptr().add(idx));
+        let diff0 = _mm512_sub_ps(va0, vb0);
+        sum0 = _mm512_add_ps(sum0, _mm512_abs_ps(diff0));
+
+        let va1 = _mm512_loadu_ps(a.as_ptr().add(idx + 16));
+        let vb1 = _mm512_loadu_ps(b.as_ptr().add(idx + 16));
+        let diff1 = _mm512_sub_ps(va1, vb1);
+        sum1 = _mm512_add_ps(sum1, _mm512_abs_ps(diff1));
+
+        let va2 = _mm512_loadu_ps(a.as_ptr().add(idx + 32));
+        let vb2 = _mm512_loadu_ps(b.as_ptr().add(idx + 32));
+        let diff2 = _mm512_sub_ps(va2, vb2);
+        sum2 = _mm512_add_ps(sum2, _mm512_abs_ps(diff2));
+
+        let va3 = _mm512_loadu_ps(a.as_ptr().add(idx + 48));
+        let vb3 = _mm512_loadu_ps(b.as_ptr().add(idx + 48));
+        let diff3 = _mm512_sub_ps(va3, vb3);
+        sum3 = _mm512_add_ps(sum3, _mm512_abs_ps(diff3));
+    }
+
+    let sum01 = _mm512_add_ps(sum0, sum1);
+    let sum23 = _mm512_add_ps(sum2, sum3);
+    let mut sum = _mm512_add_ps(sum01, sum23);
+
+    let remaining_start = chunks * 64;
+    let remaining_chunks = (len - remaining_start) / 16;
+    for i in 0..remaining_chunks {
+        let idx = remaining_start + i * 16;
         let va = _mm512_loadu_ps(a.as_ptr().add(idx));
         let vb = _mm512_loadu_ps(b.as_ptr().add(idx));
         let diff = _mm512_sub_ps(va, vb);
-        let abs_diff = _mm512_abs_ps(diff);
-        sum = _mm512_add_ps(sum, abs_diff);
+        sum = _mm512_add_ps(sum, _mm512_abs_ps(diff));
     }
 
     let mut total = _mm512_reduce_add_ps(sum);
 
-    for i in (chunks * 16)..len {
+    let scalar_start = remaining_start + remaining_chunks * 16;
+    for i in scalar_start..len {
         total += (a[i] - b[i]).abs();
     }
 
