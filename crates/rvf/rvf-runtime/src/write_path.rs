@@ -137,7 +137,7 @@ impl SegmentWriter {
     /// Write a minimal MANIFEST_SEG recording current state.
     ///
     /// This is a simplified manifest that stores:
-    /// - epoch, dimension, total_vectors, total_segments, profile_id
+    /// - epoch, dimension, total_vectors, total_segments, profile_id, metric_id
     /// - segment directory entries (seg_id, offset, length, type)
     /// - deletion bitmap (vector IDs as simple packed u64 array)
     /// - file identity (68 bytes, appended for lineage provenance)
@@ -149,6 +149,7 @@ impl SegmentWriter {
         dimension: u16,
         total_vectors: u64,
         profile_id: u8,
+        metric_id: u8,
         segment_dir: &[(u64, u64, u64, u8)], // (seg_id, offset, payload_len, seg_type)
         deleted_ids: &[u64],
     ) -> io::Result<(u64, u64)> {
@@ -158,6 +159,7 @@ impl SegmentWriter {
             dimension,
             total_vectors,
             profile_id,
+            metric_id,
             segment_dir,
             deleted_ids,
             None,
@@ -165,6 +167,10 @@ impl SegmentWriter {
     }
 
     /// Write a MANIFEST_SEG with optional FileIdentity appended.
+    ///
+    /// The `metric_id` is encoded into header byte [19] (previously a reserved
+    /// zero byte): 0 = L2, 1 = InnerProduct, 2 = Cosine.  Old stores that
+    /// wrote 0x00 at that position boot correctly as L2 (backward-compatible).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn write_manifest_seg_with_identity<W: Write + Seek>(
         &mut self,
@@ -173,6 +179,7 @@ impl SegmentWriter {
         dimension: u16,
         total_vectors: u64,
         profile_id: u8,
+        metric_id: u8,
         segment_dir: &[(u64, u64, u64, u8)],
         deleted_ids: &[u64],
         file_identity: Option<&rvf_types::FileIdentity>,
@@ -190,12 +197,15 @@ impl SegmentWriter {
         let mut payload = Vec::with_capacity(payload_size);
 
         // Manifest header.
+        // Layout: epoch[0..4] | dim[4..6] | total_vecs[6..14] | seg_count[14..18]
+        //         | profile_id[18] | metric_id[19] | reserved[20..22]
         payload.extend_from_slice(&epoch.to_le_bytes());
         payload.extend_from_slice(&dimension.to_le_bytes());
         payload.extend_from_slice(&total_vectors.to_le_bytes());
         payload.extend_from_slice(&seg_count.to_le_bytes());
         payload.push(profile_id);
-        payload.extend_from_slice(&[0u8; 3]); // reserved
+        payload.push(metric_id); // byte [19]: distance metric identifier
+        payload.extend_from_slice(&[0u8; 2]); // bytes [20..22]: reserved
 
         // Segment directory.
         for &(sid, off, plen, stype) in segment_dir {

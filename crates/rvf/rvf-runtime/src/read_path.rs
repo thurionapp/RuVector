@@ -6,6 +6,7 @@
 //! 3. Background: parse Level 1 -> full segment directory
 //! 4. On-demand: load cold segments as queries need them
 
+use crate::options::DistanceMetric;
 use rvf_types::{FileIdentity, SegmentHeader, SegmentType, SEGMENT_HEADER_SIZE, SEGMENT_MAGIC};
 use std::io::{self, Read, Seek, SeekFrom};
 
@@ -31,6 +32,11 @@ pub(crate) struct ParsedManifest {
     pub dimension: u16,
     pub total_vectors: u64,
     pub profile_id: u8,
+    /// Distance metric decoded from byte [19] of the manifest header.
+    ///
+    /// Stores written before this field existed have 0x00 there (reserved),
+    /// which decodes as `DistanceMetric::L2` — the backward-compatible default.
+    pub metric: DistanceMetric,
     pub segment_dir: Vec<SegDirEntry>,
     pub deleted_ids: Vec<u64>,
     pub file_identity: Option<FileIdentity>,
@@ -159,6 +165,9 @@ fn parse_manifest_payload(payload: &[u8]) -> Option<ParsedManifest> {
     ]);
     let seg_count = u32::from_le_bytes([payload[14], payload[15], payload[16], payload[17]]);
     let profile_id = payload[18];
+    // Byte [19] encodes the distance metric (was reserved zero in older stores).
+    // DistanceMetric::from_id(0) == L2, so old stores boot correctly.
+    let metric = DistanceMetric::from_id(payload[19]);
 
     let mut offset = 22; // past header (4+2+8+4+1+3)
 
@@ -269,6 +278,7 @@ fn parse_manifest_payload(payload: &[u8]) -> Option<ParsedManifest> {
         dimension,
         total_vectors,
         profile_id,
+        metric,
         segment_dir,
         deleted_ids,
         file_identity,

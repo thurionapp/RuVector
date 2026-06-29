@@ -1387,6 +1387,7 @@ impl RvfStore {
                     self.options.dimension,
                     total_vectors,
                     self.options.profile,
+                    self.options.metric.to_id(),
                     &new_segment_dir,
                     &empty_dels,
                     fi,
@@ -2467,6 +2468,13 @@ impl RvfStore {
         self.epoch = manifest.epoch;
         self.options.dimension = manifest.dimension;
         self.options.profile = manifest.profile_id;
+        // Restore the distance metric persisted in the manifest header (byte
+        // [19], previously a reserved zero).  Old stores read 0x00 there and
+        // boot as L2 — the correct backward-compatible default.  Without this
+        // restore, COW dual-graph queries open the parent via open_readonly()
+        // which goes through boot() and was silently resetting the metric to
+        // L2, breaking cosine queries (recall@10 ≈ 0.10 → ≈ 1.0 after fix).
+        self.options.metric = manifest.metric;
         // Pre-size the slab from the manifest so the cold-open load does a
         // single allocation instead of growing through repeated doublings.
         self.vectors = VectorData::with_capacity(
@@ -2577,6 +2585,7 @@ impl RvfStore {
                     self.options.dimension,
                     total_vectors,
                     self.options.profile,
+                    self.options.metric.to_id(),
                     &self.segment_dir,
                     &deleted_ids,
                     fi,

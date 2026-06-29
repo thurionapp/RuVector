@@ -19,6 +19,35 @@ pub enum DistanceMetric {
     Cosine,
 }
 
+impl DistanceMetric {
+    /// Encode this metric as a single byte for manifest persistence.
+    ///
+    /// Encoding: 0 = L2 (default / backward-compatible), 1 = InnerProduct, 2 = Cosine.
+    /// Old manifests written before this field existed have 0x00 at that byte
+    /// (it was a reserved zero), so they boot correctly as L2.
+    pub(crate) fn to_id(self) -> u8 {
+        match self {
+            DistanceMetric::L2 => 0,
+            DistanceMetric::InnerProduct => 1,
+            DistanceMetric::Cosine => 2,
+        }
+    }
+
+    /// Decode a metric from a manifest byte.
+    ///
+    /// Unknown values fall back to L2 for forward-compatibility: a store
+    /// written by a newer version with an unknown metric ID is treated as
+    /// L2-distance, which is at least type-safe even if not semantically
+    /// correct.
+    pub(crate) fn from_id(id: u8) -> Self {
+        match id {
+            1 => DistanceMetric::InnerProduct,
+            2 => DistanceMetric::Cosine,
+            _ => DistanceMetric::L2,
+        }
+    }
+}
+
 /// Compression profile for stored vectors.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum CompressionProfile {

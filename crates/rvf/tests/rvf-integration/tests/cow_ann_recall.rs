@@ -206,6 +206,187 @@ fn cow_ann_recall_vs_exact() {
 }
 
 // ===========================================================================
+// TEST 5: cow_ann_recall_vs_exact_cosine
+// ===========================================================================
+
+/// Cosine-metric COW recall regression test.
+///
+/// This is the primary regression test for the native COW dual-graph cosine
+/// bug (fixed in this PR): before the fix the parent store was re-opened via
+/// `open_readonly()` which went through `boot()` without restoring the metric,
+/// so the parent defaulted to L2.  The parent HNSW was built with L2 distance
+/// and returned L2-ordered candidates that were then merged with the child's
+/// cosine distances — completely breaking the ordering.
+///
+/// Before fix: cosine recall@10 ≈ 0.10 (bug reproducible here).
+/// After fix : cosine recall@10 ≥ 0.95 (metric persisted in manifest).
+///
+/// Design mirrors `cow_ann_recall_vs_exact` (L2) with:
+/// - `metric: DistanceMetric::Cosine`
+/// - ground-truth computed via cosine distance (1 − cos_sim)
+/// - same child-edit mix (60 new, 20 override, 10 tombstone)
+fn make_cosine_opts(dim: u16) -> RvfOptions {
+    RvfOptions {
+        dimension: dim,
+        metric: DistanceMetric::Cosine,
+        ..Default::default()
+    }
+}
+
+/// Cosine distance: 1 − dot(a,b)/(‖a‖·‖b‖).
+fn cosine_dist(a: &[f32], b: &[f32]) -> f32 {
+    let mut dot = 0.0f32;
+    let mut na = 0.0f32;
+    let mut nb = 0.0f32;
+    for (x, y) in a.iter().zip(b.iter()) {
+        dot += x * y;
+        na += x * x;
+        nb += y * y;
+    }
+    let denom = (na * nb).sqrt();
+    if denom < f32::EPSILON {
+        1.0
+    } else {
+        1.0 - dot / denom
+    }
+}
+
+/// Exact brute-force k-NN over a slice of (id, vector) pairs using cosine
+/// distance.
+fn exact_knn_cosine(query: &[f32], corpus: &[(u64, Vec<f32>)], k: usize) -> Vec<u64> {
+    let mut dists: Vec<(u64, f32)> = corpus
+        .iter()
+        .map(|(id, v)| (*id, cosine_dist(query, v)))
+        .collect();
+    dists.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+    dists.iter().take(k).map(|(id, _)| *id).collect()
+}
+
+#[test]
+fn cow_ann_recall_vs_exact_cosine() {
+    let dir = TempDir::new().unwrap();
+    let base_path = dir.path().join("base_cos.rvf");
+    let child_path = dir.path().join("child_cos.rvf");
+    // Use the same dim/count as the L2 test so the parent slab is large enough
+    // for HNSW to kick in on both arms.
+    const DIM: u16 = 32;
+    const BASE_N: usize = 1_200;
+    const K: usize = 10;
+
+    // ── Build base store (cosine metric) ─────────────────────────────────
+    let mut base = RvfStore::create(&base_path, make_cosine_opts(DIM)).unwrap();
+    let base_vecs: Vec<Vec<f32>> = (0..BASE_N)
+        .map(|i| lcg_vector(DIM as usize, i as u64 + 20_000))
+        .collect();
+    let base_refs: Vec<&[f32]> = base_vecs.iter().map(|v| v.as_slice()).collect();
+    let base_ids: Vec<u64> = (0..BASE_N as u64).collect();
+    base.ingest_batch(&base_refs, &base_ids, None).unwrap();
+    base.close().unwrap();
+
+    // ── Branch ───────────────────────────────────────────────────────────
+    let mut base = RvfStore::open(&base_path).unwrap();
+    // Verify the metric was persisted correctly (sanity check).
+    assert_eq!(
+        base.metric(),
+        DistanceMetric::Cosine,
+        "base store metric must survive close()+open() round-trip"
+    );
+    let mut child = base.branch(&child_path).unwrap();
+    base.close().unwrap();
+
+    // ── Child edits ───────────────────────────────────────────────────────
+    // (a) 60 new vectors (IDs 5000..5059)
+    const NEW_START: u64 = 5_000;
+    const NEW_COUNT: usize = 60;
+    let new_vecs: Vec<Vec<f32>> = (0..NEW_COUNT)
+        .map(|i| lcg_vector(DIM as usize, 29_000 + i as u64))
+        .collect();
+    let new_refs: Vec<&[f32]> = new_vecs.iter().map(|v| v.as_slice()).collect();
+    let new_ids: Vec<u64> = (NEW_START..NEW_START + NEW_COUNT as u64).collect();
+    child.ingest_batch(&new_refs, &new_ids, None).unwrap();
+
+    // (b) Override 20 parent vectors (IDs 0..19).
+    const OVERRIDE_COUNT: usize = 20;
+    let override_vecs: Vec<Vec<f32>> = (0..OVERRIDE_COUNT)
+        .map(|i| lcg_vector(DIM as usize, 99_000 + i as u64))
+        .collect();
+    let override_refs: Vec<&[f32]> = override_vecs.iter().map(|v| v.as_slice()).collect();
+    let override_ids: Vec<u64> = (0..OVERRIDE_COUNT as u64).collect();
+    child
+        .ingest_batch(&override_refs, &override_ids, None)
+        .unwrap();
+
+    // (c) Tombstone 10 parent vectors (IDs 100..109).
+    const TOMBSTONE_START: u64 = 100;
+    const TOMBSTONE_COUNT: usize = 10;
+    let tombstone_ids: Vec<u64> =
+        (TOMBSTONE_START..TOMBSTONE_START + TOMBSTONE_COUNT as u64).collect();
+    child.delete(&tombstone_ids).unwrap();
+
+    // ── Build cosine ground-truth corpus visible from child ───────────────
+    let mut ground_truth_corpus: Vec<(u64, Vec<f32>)> = Vec::new();
+
+    let override_set: std::collections::HashSet<u64> = override_ids.iter().copied().collect();
+    let tombstone_set: std::collections::HashSet<u64> = tombstone_ids.iter().copied().collect();
+    for (i, v) in base_vecs.iter().enumerate() {
+        let id = i as u64;
+        if override_set.contains(&id) || tombstone_set.contains(&id) {
+            continue;
+        }
+        ground_truth_corpus.push((id, v.clone()));
+    }
+    for (i, v) in override_vecs.iter().enumerate() {
+        ground_truth_corpus.push((override_ids[i], v.clone()));
+    }
+    for (i, v) in new_vecs.iter().enumerate() {
+        ground_truth_corpus.push((new_ids[i], v.clone()));
+    }
+
+    // ── Query ─────────────────────────────────────────────────────────────
+    // Use a query vector near parent vector 500 (not overridden, not tombstoned).
+    let query = lcg_vector(DIM as usize, 500 + 20_000);
+
+    // Exact cosine ground truth.
+    let exact_top_k = exact_knn_cosine(&query, &ground_truth_corpus, K);
+    assert_eq!(
+        exact_top_k.len(),
+        K,
+        "ground truth must return K={K} results"
+    );
+
+    // COW ANN via dual-graph merge (the path that was broken before the fix).
+    let ann_opts = QueryOptions {
+        ef_search: 300,
+        ..Default::default()
+    };
+    let ann_results = child.query(&query, K, &ann_opts).unwrap();
+    assert_eq!(ann_results.len(), K, "ANN query must return K={K} results");
+    let ann_ids: Vec<u64> = ann_results.iter().map(|r| r.id).collect();
+
+    let recall = recall_at_k(&ann_ids, &exact_top_k);
+    println!(
+        "cow_ann_recall_vs_exact_cosine: recall@{K} = {:.4} (ANN top-{K}: {:?})",
+        recall, ann_ids
+    );
+
+    // Before the fix this assertion fired with recall ≈ 0.10.
+    // After the fix (metric persisted in manifest → parent re-opened with
+    // the correct Cosine metric) recall@10 must be ≥ 0.95.
+    assert!(
+        recall >= 0.95,
+        "recall@{K} {:.4} is below the 0.95 contract — \
+         possible metric-persistence regression (ANN={:?}, exact={:?})",
+        recall,
+        ann_ids,
+        exact_top_k
+    );
+
+    child.close().unwrap();
+
+    println!("PASS: cow_ann_recall_vs_exact_cosine (recall@{K} = {recall:.4})");
+}
+
+// ===========================================================================
 // TEST 2: cow_ann_override_correctness
 // ===========================================================================
 
