@@ -23,6 +23,8 @@
  * ```
  */
 
+import { writeFileSync, readFileSync, mkdirSync } from 'fs';
+import { dirname } from 'path';
 import { Embedding, TrainingConfig, TrainingResult } from './types';
 import { LoraAdapter } from './lora';
 import { EwcManager } from './sona';
@@ -93,6 +95,27 @@ export interface Checkpoint {
   /** Timestamp */
   timestamp: number;
 }
+
+/**
+ * Result of a saveCheckpoint() call.
+ */
+export interface CheckpointSaveResult {
+  /** Index of the checkpoint in the in-memory checkpoint list */
+  index: number;
+  /** Epoch the checkpoint captured */
+  epoch: number;
+  /** Step the checkpoint captured */
+  step: number;
+  /** Training loss at checkpoint time */
+  loss: number;
+  /** Absolute or as-given file path, when persisted to disk */
+  path?: string;
+  /** Serialized size in bytes, when persisted to disk */
+  bytes?: number;
+}
+
+/** On-disk checkpoint envelope (versioned for forward compatibility). */
+const CHECKPOINT_FORMAT_VERSION = 1;
 
 /**
  * Learning Rate Scheduler
@@ -448,23 +471,71 @@ export class TrainingPipeline {
   }
 
   /**
-   * Save checkpoint
+   * Save a checkpoint.
+   *
+   * Always records the checkpoint in the in-memory list (the behavior the
+   * training loop relies on). When `path` is given, additionally persists
+   * the checkpoint to disk as versioned JSON — before v2.5.7 this method
+   * was private, ignored any argument, and never wrote a file, so callers
+   * passing a path got `undefined` back and zero bytes on disk.
+   *
+   * @param path Optional file path; parent directories are created.
+   * @returns Where the checkpoint went — in-memory index, and file
+   *          path + byte size when persisted.
    */
-  private saveCheckpoint(): void {
-    this.checkpoints.push({
+  saveCheckpoint(path?: string): CheckpointSaveResult {
+    const checkpoint: Checkpoint = {
       epoch: this.currentEpoch,
       step: this.currentStep,
       loss: this.metrics.avgLoss(100),
       weights: this.adapter.toJSON(),
       timestamp: Date.now(),
-    });
+    };
+    this.checkpoints.push(checkpoint);
+
+    const result: CheckpointSaveResult = {
+      index: this.checkpoints.length - 1,
+      epoch: checkpoint.epoch,
+      step: checkpoint.step,
+      loss: checkpoint.loss,
+    };
+
+    if (path) {
+      const envelope = {
+        format: 'ruvllm-checkpoint',
+        version: CHECKPOINT_FORMAT_VERSION,
+        ...checkpoint,
+      };
+      const serialized = JSON.stringify(envelope);
+      mkdirSync(dirname(path), { recursive: true });
+      writeFileSync(path, serialized, 'utf-8');
+      result.path = path;
+      result.bytes = Buffer.byteLength(serialized, 'utf-8');
+    }
+
+    return result;
   }
 
   /**
-   * Load checkpoint
+   * Load a checkpoint — by in-memory index, or from a file previously
+   * written by `saveCheckpoint(path)`.
    */
-  loadCheckpoint(index: number): boolean {
-    const checkpoint = this.checkpoints[index];
+  loadCheckpoint(indexOrPath: number | string): boolean {
+    let checkpoint: Checkpoint | undefined;
+
+    if (typeof indexOrPath === 'number') {
+      checkpoint = this.checkpoints[indexOrPath];
+    } else {
+      try {
+        const parsed = JSON.parse(readFileSync(indexOrPath, 'utf-8'));
+        if (parsed?.format !== 'ruvllm-checkpoint' || typeof parsed.weights !== 'string') {
+          return false;
+        }
+        checkpoint = parsed as Checkpoint;
+      } catch {
+        return false;
+      }
+    }
     if (!checkpoint) return false;
 
     this.adapter = LoraAdapter.fromJSON(checkpoint.weights);
