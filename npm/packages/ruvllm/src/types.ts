@@ -588,6 +588,13 @@ export interface TrainingConfig {
   ewcLambda?: number;
   /** Validation split ratio */
   validationSplit?: number;
+  /**
+   * File path for best-checkpoint retention. When set, the pipeline writes
+   * the current state to this path each time validation loss improves, so the
+   * best-validation model survives even if later epochs degrade. Empty string
+   * (the default) disables it; a no-op when validation never runs.
+   */
+  keepBestCheckpoint?: string;
 }
 
 /**

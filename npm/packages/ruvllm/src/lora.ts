@@ -284,6 +284,23 @@ export class LoraAdapter {
   }
 
   /**
+   * Get input dimension (rows of loraA).
+   *
+   * The adapter's geometry (inputDim/outputDim) is not part of LoRAConfig,
+   * so these getters expose it for checkpoint metadata and shape validation.
+   */
+  getInputDim(): number {
+    return this.inputDim;
+  }
+
+  /**
+   * Get output dimension (cols of loraB).
+   */
+  getOutputDim(): number {
+    return this.outputDim;
+  }
+
+  /**
    * Get adapter weights
    */
   getWeights(): LoraWeights {
