@@ -168,6 +168,8 @@ pub use autodetect::{
 };
 #[cfg(feature = "candle")]
 pub use backends::CandleBackend;
+#[cfg(all(feature = "lattice", target_os = "macos"))]
+pub use backends::LatticeBackend;
 pub use backends::{
     create_backend, DType, DeviceType, GenerateParams, GeneratedToken, LlmBackend,
     ModelArchitecture, ModelConfig, ModelInfo, Quantization, SharedBackend, SpecialTokens,

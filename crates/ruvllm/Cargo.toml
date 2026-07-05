@@ -106,6 +106,10 @@ md5 = "0.7"
 metal = { version = "0.29", optional = true }
 objc = { version = "0.2", optional = true }
 
+# Lattice pure-Rust Qwen3.5 inference engine, Metal GPU forward pass
+# (macOS only, optional, default-OFF — see the `lattice` feature below).
+lattice-inference = { version = "0.5.0", optional = true, default-features = false, features = ["metal-gpu", "f16", "std"] }
+
 # Core ML bindings (macOS/iOS) - for Apple Neural Engine acceleration
 objc2 = { version = "0.6", optional = true }
 objc2-foundation = { version = "0.3", optional = true, features = ["NSString", "NSError", "NSURL", "NSArray", "NSDictionary", "NSData"] }
@@ -151,6 +155,13 @@ parallel = ["dep:rayon"]
 # the openssl-sys-via-hf-hub-via-ureq cross-link mess. Local-path model
 # load works without it; HF Hub fetch needs `hub-download` feature.
 candle = ["candle-core", "candle-nn", "candle-transformers", "tokenizers"]
+
+# Lattice backend for LLM inference (pure-Rust, Metal acceleration on Mac).
+# macOS-only today: the dependency is declared under
+# `[target.'cfg(target_os = "macos")'.dependencies]` so `metal`/`objc` FFI
+# never reaches non-macOS targets, and the backend module itself is gated
+# `#[cfg(all(feature = "lattice", target_os = "macos"))]`. Default-OFF.
+lattice = ["dep:lattice-inference"]
 
 # HuggingFace Hub auto-download (default-on for the workstation builds
 # the user runs day-to-day; off for aarch64 cross-builds).
