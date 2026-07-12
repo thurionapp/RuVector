@@ -102,6 +102,9 @@ pub use embeddings::CandleEmbedding;
 #[cfg(feature = "onnx-embeddings")]
 pub use embeddings::OnnxEmbedding;
 
+#[cfg(feature = "lattice-embeddings")]
+pub use embeddings::LatticeEmbedding;
+
 // Compile-time warning about AgenticDB limitations
 #[cfg(feature = "storage")]
 #[allow(deprecated, clippy::let_unit_value)]

@@ -6,6 +6,7 @@
 //!
 //! - **HashEmbedding**: Fast hash-based placeholder (default, not semantic)
 //! - **OnnxEmbedding**: Real semantic embeddings using ONNX Runtime (feature: `onnx-embeddings`) ✅ RECOMMENDED
+//! - **LatticeEmbedding**: Real semantic embeddings using lattice-embed, pure-Rust native inference (feature: `lattice-embeddings`)
 //! - **CandleEmbedding**: Real embeddings using candle-transformers (feature: `real-embeddings`)
 //! - **ApiEmbedding**: External API calls (OpenAI, Anthropic, Cohere, etc.)
 //!
@@ -33,7 +34,11 @@
 //! ```
 
 use crate::error::Result;
-#[cfg(any(feature = "real-embeddings", feature = "api-embeddings"))]
+#[cfg(any(
+    feature = "real-embeddings",
+    feature = "api-embeddings",
+    feature = "lattice-embeddings"
+))]
 use crate::error::RuvectorError;
 use std::sync::Arc;
 
@@ -718,6 +723,384 @@ pub mod onnx {
 #[cfg(feature = "onnx-embeddings")]
 pub use onnx::OnnxEmbedding;
 
+// ============================================================================
+// Lattice Embeddings (pure-Rust, native, no C++ FFI / no ONNX Runtime)
+// ============================================================================
+
+/// Native embedding provider backed by [`lattice-embed`](https://crates.io/crates/lattice-embed),
+/// a pure-Rust transformer inference engine (SIMD matmul, safetensors weight
+/// loading, no ONNX Runtime, no C++ FFI).
+///
+/// Requires feature flag: `lattice-embeddings`
+///
+/// ## Supported models
+/// - `bge-small-en-v1.5` / `BAAI/bge-small-en-v1.5` (384 dims, default, recommended for `.rvf` packs)
+/// - `bge-base-en-v1.5` / `BAAI/bge-base-en-v1.5` (768 dims)
+/// - `bge-large-en-v1.5` / `BAAI/bge-large-en-v1.5` (1024 dims)
+/// - `multilingual-e5-small` / `intfloat/multilingual-e5-small` (384 dims)
+/// - `multilingual-e5-base` / `intfloat/multilingual-e5-base` (768 dims)
+/// - `all-minilm-l6-v2` / `sentence-transformers/all-MiniLM-L6-v2` (384 dims)
+/// - `paraphrase-multilingual-minilm-l12-v2` / `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` (384 dims)
+/// - `qwen3-embedding-0.6b` / `Qwen/Qwen3-Embedding-0.6B` (1024 dims)
+/// - `qwen3-embedding-4b` / `Qwen/Qwen3-Embedding-4B` (2560 dims)
+///
+/// Model-id parsing is delegated to `lattice_embed::EmbeddingModel`'s own
+/// `FromStr` impl (case-insensitive, accepts display names, short names, and
+/// HuggingFace ids) rather than re-implementing the mapping here, so this
+/// provider stays in sync with lattice-embed's canonical model table.
+///
+/// ## CPU / native, no GPU
+/// This provider uses lattice-embed's default `native` feature (CPU-only,
+/// SIMD-accelerated). It does **not** enable lattice-embed's `metal-gpu`
+/// feature.
+///
+/// ## Minimum Supported Rust Version
+/// Enabling the `lattice-embeddings` feature raises the effective MSRV for
+/// this crate to Rust 1.93 (edition 2024), since `lattice-embed` requires it.
+/// Cargo has no mechanism to express a per-feature `rust-version`, so this is
+/// not reflected in `rust-version.workspace = true` above — it only applies
+/// when this feature is enabled. The crate's default build (feature
+/// disabled) keeps the workspace MSRV of 1.77.
+///
+/// ## Model download
+/// BERT-family models (BGE, E5, MiniLM) download automatically from
+/// HuggingFace into `~/.lattice/models` on first use. Qwen3-Embedding models
+/// must be placed at `~/.lattice/models/qwen3-embedding-{0.6b,4b}/` manually
+/// (or pointed to via `LATTICE_QWEN_MODEL_DIR`) before first use.
+///
+/// ## Asymmetric retrieval (query vs. passage prefixing)
+/// BGE, E5, and Qwen3-Embedding are asymmetric retrievers: the query side is
+/// prefixed with a retrieval instruction, the document side is not.
+/// [`EmbeddingProvider::embed`] always takes the **passage/document** side (no
+/// query instruction) via `lattice_embed::EmbeddingService::embed_passage`.
+/// Use the inherent [`LatticeEmbedding::embed_query`] method for query text —
+/// it applies the model's query instruction via
+/// `EmbeddingService::embed_query`: BGE v1.5 prefixes queries with
+/// `"Represent this sentence for searching relevant passages: "`, E5 with
+/// `"query: "`, and Qwen3-Embedding with its search instruction. For all three
+/// families `embed_query` and `embed` therefore produce different vectors,
+/// which is what makes asymmetric retrieval correct. MiniLM is genuinely
+/// symmetric (contrastive training on raw text, no prefix), so its two methods
+/// are equivalent.
+///
+/// # Example
+/// ```rust,no_run
+/// use ruvector_core::embeddings::{EmbeddingProvider, LatticeEmbedding};
+///
+/// let provider = LatticeEmbedding::from_pretrained("bge-small-en-v1.5")?;
+///
+/// // Document side: no query instruction.
+/// let doc_embedding = provider.embed("The cat sat on the mat.")?;
+/// assert_eq!(doc_embedding.len(), 384);
+///
+/// // Query side: applies the model's query instruction, if any.
+/// let query_embedding = provider.embed_query("Where did the cat sit?")?;
+/// assert_eq!(query_embedding.len(), 384);
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+#[cfg(feature = "lattice-embeddings")]
+pub mod lattice_native {
+    use super::*;
+    use lattice_embed::{
+        EmbeddingModel as LatticeEmbeddingModel, EmbeddingService, NativeEmbeddingService,
+    };
+    use std::sync::mpsc;
+    use std::sync::Mutex;
+    use std::thread;
+
+    /// Which side of asymmetric retrieval a queued embedding request is for.
+    enum EmbedKind {
+        Query,
+        Passage,
+    }
+
+    /// A single embedding request sent to the worker thread, with a
+    /// per-request reply channel for the result.
+    struct EmbedRequest {
+        kind: EmbedKind,
+        text: String,
+        reply_tx: mpsc::Sender<std::result::Result<Vec<f32>, String>>,
+    }
+
+    /// See the [module-level docs](self) for the full provider description.
+    ///
+    /// # Examples
+    /// Embed a passage and a query on an asymmetric BGE model. The query is
+    /// embedded with [`embed_query`](LatticeEmbedding::embed_query), which
+    /// applies BGE's retrieval instruction, so it produces a different vector
+    /// than passing the same text through [`EmbeddingProvider::embed`] (the
+    /// passage side). Using `embed_query` for queries is what makes
+    /// query-to-passage retrieval scores correct on asymmetric models.
+    /// ```rust,no_run
+    /// use ruvector_core::embeddings::{EmbeddingProvider, LatticeEmbedding};
+    ///
+    /// let provider = LatticeEmbedding::from_pretrained("bge-small-en-v1.5")?;
+    ///
+    /// let passage = provider.embed("The Eiffel Tower is in Paris, France.")?;
+    /// let query = provider.embed_query("Where is the Eiffel Tower?")?;
+    /// assert_eq!(passage.len(), provider.dimensions());
+    /// assert_eq!(query.len(), provider.dimensions());
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    /// A runnable version that prints the cosine similarities of the query and
+    /// passage vectors is in `examples/lattice_embedding_example.rs`.
+    ///
+    /// # Threading model
+    /// `lattice-embed`'s [`EmbeddingService`] is `async`-only (no sync/blocking
+    /// API), but [`EmbeddingProvider::embed`] is a sync method that ruvector-core
+    /// callers may invoke from anywhere, including from inside an existing Tokio
+    /// runtime (e.g. an async server handler). Bridging via a stored
+    /// `Runtime::block_on` would panic in that case (`block_on` cannot be
+    /// called from within an already-running runtime). Instead, the runtime and
+    /// the embedding service live on a dedicated worker thread with no ambient
+    /// async context of its own; `embed` / `embed_query` send a request over a
+    /// channel and block on `Receiver::recv`, which is safe to call from any
+    /// context, sync or async.
+    pub struct LatticeEmbedding {
+        model: LatticeEmbeddingModel,
+        model_id: &'static str,
+        dimensions: usize,
+        request_tx: Mutex<mpsc::Sender<EmbedRequest>>,
+        // Keeps the worker thread's handle alive for the lifetime of this
+        // provider. Not joined on drop (that would block); dropping
+        // `request_tx` closes the channel, which ends the worker's `recv`
+        // loop and lets the thread exit on its own.
+        _worker: thread::JoinHandle<()>,
+    }
+
+    impl LatticeEmbedding {
+        /// Load a pre-trained embedding model by id.
+        ///
+        /// Accepts display names (`"bge-small-en-v1.5"`), short names
+        /// (`"bge-small"`, `"small"`), and HuggingFace ids
+        /// (`"BAAI/bge-small-en-v1.5"`) — see [`lattice_embed::EmbeddingModel`]'s
+        /// `FromStr` impl for the full accepted set. Returns an error for any
+        /// unrecognized id, and for any id that resolves to a model
+        /// [`lattice_embed`]'s native service cannot run locally (e.g. the
+        /// remote-only OpenAI variants).
+        ///
+        /// # Example
+        /// ```rust,no_run
+        /// use ruvector_core::embeddings::LatticeEmbedding;
+        ///
+        /// let provider = LatticeEmbedding::from_pretrained("bge-small-en-v1.5")?;
+        /// # Ok::<(), Box<dyn std::error::Error>>(())
+        /// ```
+        pub fn from_pretrained(model_id: &str) -> Result<Self> {
+            let model: LatticeEmbeddingModel = model_id.parse().map_err(|e: String| {
+                RuvectorError::ModelLoadError(format!(
+                    "unknown lattice-embed model id '{model_id}': {e}"
+                ))
+            })?;
+            Self::with_model(model)
+        }
+
+        /// Load a pre-trained embedding model from an already-resolved
+        /// [`lattice_embed::EmbeddingModel`] variant.
+        pub fn with_model(model: LatticeEmbeddingModel) -> Result<Self> {
+            if !model.is_local() {
+                return Err(RuvectorError::ModelLoadError(format!(
+                    "'{model}' cannot be loaded natively: lattice-embed's \
+                     NativeEmbeddingService only supports models it can run \
+                     on-device. Remote/API-only models (e.g. the OpenAI \
+                     text-embedding-* family) are not supported by LatticeEmbedding."
+                )));
+            }
+
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| {
+                    RuvectorError::ModelLoadError(format!(
+                        "failed to build tokio runtime for LatticeEmbedding: {e}"
+                    ))
+                })?;
+            let service = NativeEmbeddingService::with_model(model);
+
+            let (request_tx, request_rx) = mpsc::channel::<EmbedRequest>();
+            let worker = thread::Builder::new()
+                .name("lattice-embed-worker".to_string())
+                .spawn(move || {
+                    // No ambient Tokio runtime exists on this thread, so
+                    // `block_on` here can never panic on nested-runtime
+                    // grounds regardless of the caller's own context.
+                    for request in request_rx {
+                        let outcome = runtime.block_on(async {
+                            match request.kind {
+                                EmbedKind::Query => {
+                                    service.embed_query(&[request.text], model).await
+                                }
+                                EmbedKind::Passage => {
+                                    service.embed_passage(&[request.text], model).await
+                                }
+                            }
+                        });
+                        let mapped =
+                            outcome
+                                .map_err(|e| e.to_string())
+                                .and_then(|mut embeddings| {
+                                    embeddings.pop().ok_or_else(|| {
+                                        "lattice-embed returned no embedding".to_string()
+                                    })
+                                });
+                        // Ignore send errors: they only occur if the caller
+                        // already dropped its reply receiver.
+                        let _ = request.reply_tx.send(mapped);
+                    }
+                })
+                .map_err(|e| {
+                    RuvectorError::ModelLoadError(format!(
+                        "failed to spawn LatticeEmbedding worker thread: {e}"
+                    ))
+                })?;
+
+            Ok(Self {
+                model,
+                model_id: model.model_id(),
+                dimensions: model.dimensions(),
+                request_tx: Mutex::new(request_tx),
+                _worker: worker,
+            })
+        }
+
+        /// Get the dimensionality of embeddings produced by the loaded model.
+        pub fn dimensions(&self) -> usize {
+            self.dimensions
+        }
+
+        /// Embed **query** text, applying the model's query-side prompt
+        /// instruction if it uses one (BGE v1.5's `"Represent this sentence
+        /// for searching relevant passages: "` prefix, E5's `"query: "`
+        /// prefix, Qwen3's search-query instruction). For those asymmetric
+        /// models this produces a different vector than
+        /// [`EmbeddingProvider::embed`]; only MiniLM is symmetric, so its two
+        /// methods are equivalent.
+        ///
+        /// This is what makes asymmetric retrieval correct: index documents
+        /// via [`EmbeddingProvider::embed`] (passage side, no prefix) and
+        /// embed the search query via this method (query side, prefixed).
+        ///
+        /// Safe to call from any context, including from inside a Tokio
+        /// runtime — see the [threading model](LatticeEmbedding#threading-model).
+        pub fn embed_query(&self, text: &str) -> Result<Vec<f32>> {
+            self.send_request(EmbedKind::Query, text)
+        }
+
+        /// Send an embedding request to the worker thread and block on the
+        /// reply. Never calls `block_on` on the caller's thread, so this is
+        /// safe to invoke from inside an existing async runtime.
+        fn send_request(&self, kind: EmbedKind, text: &str) -> Result<Vec<f32>> {
+            let (reply_tx, reply_rx) = mpsc::channel();
+            let request = EmbedRequest {
+                kind,
+                text: text.to_string(),
+                reply_tx,
+            };
+
+            self.request_tx
+                .lock()
+                .map_err(|_| {
+                    RuvectorError::ModelInferenceError(
+                        "lattice-embed embedding worker request channel poisoned".to_string(),
+                    )
+                })?
+                .send(request)
+                .map_err(|_| {
+                    RuvectorError::ModelInferenceError(
+                        "lattice-embed embedding worker unavailable".to_string(),
+                    )
+                })?;
+
+            reply_rx
+                .recv()
+                .map_err(|_| {
+                    RuvectorError::ModelInferenceError(
+                        "lattice-embed embedding worker unavailable".to_string(),
+                    )
+                })?
+                .map_err(|e| {
+                    RuvectorError::ModelInferenceError(format!(
+                        "lattice-embed embedding failed: {e}"
+                    ))
+                })
+        }
+    }
+
+    impl EmbeddingProvider for LatticeEmbedding {
+        /// Embed **passage/document** text (no query instruction applied).
+        ///
+        /// Use [`LatticeEmbedding::embed_query`] for the query side of
+        /// asymmetric retrieval. Safe to call from any context, including
+        /// from inside a Tokio runtime — see the
+        /// [threading model](LatticeEmbedding#threading-model).
+        fn embed(&self, text: &str) -> Result<Vec<f32>> {
+            self.send_request(EmbedKind::Passage, text)
+        }
+
+        fn dimensions(&self) -> usize {
+            self.dimensions
+        }
+
+        fn name(&self) -> &str {
+            self.model_id
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn from_pretrained_rejects_remote_only_models() {
+            // "text-embedding-3-small" and "openai" both parse successfully
+            // to `EmbeddingModel::TextEmbedding3Small` (see lattice-embed's
+            // `FromStr` impl) but that variant is remote/API-only —
+            // `NativeEmbeddingService` cannot run it. Both aliases must be
+            // rejected at construction time, not on first `embed()` call.
+            assert!(
+                LatticeEmbedding::from_pretrained("text-embedding-3-small").is_err(),
+                "remote-only model 'text-embedding-3-small' must be rejected at construction"
+            );
+            assert!(
+                LatticeEmbedding::from_pretrained("openai").is_err(),
+                "remote-only model alias 'openai' must be rejected at construction"
+            );
+        }
+
+        #[test]
+        fn from_pretrained_accepts_native_local_model() {
+            assert!(
+                LatticeEmbedding::from_pretrained("bge-small-en-v1.5").is_ok(),
+                "native local model 'bge-small-en-v1.5' must construct successfully"
+            );
+        }
+
+        /// Regression test for the nested-runtime panic: `embed` / `embed_query`
+        /// used to call `Runtime::block_on` on a `Runtime` stored on the
+        /// provider, which panics when invoked from inside an already-running
+        /// Tokio runtime. The worker-thread bridge has no ambient runtime on
+        /// the calling side, so both calls must succeed here instead.
+        #[tokio::test]
+        async fn embed_from_inside_async_runtime_does_not_panic() {
+            let provider = LatticeEmbedding::from_pretrained("bge-small-en-v1.5")
+                .expect("bge-small-en-v1.5 is a native local model");
+
+            let doc = provider
+                .embed("a nested-runtime regression test")
+                .expect("embed must not panic or error from inside a Tokio runtime");
+            assert_eq!(doc.len(), provider.dimensions());
+
+            let query = provider
+                .embed_query("a nested-runtime regression test")
+                .expect("embed_query must not panic or error from inside a Tokio runtime");
+            assert_eq!(query.len(), provider.dimensions());
+        }
+    }
+}
+
+#[cfg(feature = "lattice-embeddings")]
+pub use lattice_native::LatticeEmbedding;
+
 /// Type-erased embedding provider for dynamic dispatch
 pub type BoxedEmbeddingProvider = Arc<dyn EmbeddingProvider>;
 
@@ -837,6 +1220,65 @@ mod tests {
             for emb in &embeddings {
                 assert_eq!(emb.len(), 384);
             }
+        }
+    }
+
+    #[cfg(feature = "lattice-embeddings")]
+    mod lattice_tests {
+        use super::*;
+        use crate::embeddings::LatticeEmbedding;
+
+        /// Pure model-id mapping test — no network, no model load.
+        /// `LatticeEmbedding::from_pretrained` delegates to
+        /// `lattice_embed::EmbeddingModel::from_str`; this test locks in that
+        /// bge-small resolves from both its display name and its HuggingFace
+        /// id, and that an unrecognized id errors instead of silently
+        /// defaulting.
+        #[test]
+        fn test_lattice_from_pretrained_model_id_mapping() {
+            let by_display_name = LatticeEmbedding::from_pretrained("bge-small-en-v1.5").unwrap();
+            assert_eq!(by_display_name.dimensions(), 384);
+            assert_eq!(EmbeddingProvider::dimensions(&by_display_name), 384);
+
+            let by_hf_id = LatticeEmbedding::from_pretrained("BAAI/bge-small-en-v1.5").unwrap();
+            assert_eq!(by_hf_id.dimensions(), 384);
+
+            let unknown = LatticeEmbedding::from_pretrained("not-a-real-model");
+            assert!(
+                unknown.is_err(),
+                "unknown model id should error, not default"
+            );
+        }
+
+        #[test]
+        fn test_lattice_from_pretrained_minilm_mapping() {
+            let by_short = LatticeEmbedding::from_pretrained("all-minilm-l6-v2").unwrap();
+            assert_eq!(by_short.dimensions(), 384);
+
+            let by_hf_id =
+                LatticeEmbedding::from_pretrained("sentence-transformers/all-MiniLM-L6-v2")
+                    .unwrap();
+            assert_eq!(by_hf_id.dimensions(), 384);
+        }
+
+        /// Real end-to-end embedding test. Requires the bge-small-en-v1.5
+        /// model to be downloaded from HuggingFace on first use (~130MB) —
+        /// network access, not run in CI. Run manually with:
+        ///   cargo test -p ruvector-core --features lattice-embeddings -- --ignored lattice_tests
+        #[test]
+        #[ignore]
+        fn test_lattice_embedding_real() {
+            let provider = LatticeEmbedding::from_pretrained("bge-small-en-v1.5").unwrap();
+
+            let embedding = provider.embed("hello world").unwrap();
+            assert_eq!(embedding.len(), 384);
+            assert!(embedding.iter().all(|v| v.is_finite()));
+
+            let norm: f32 = embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
+            assert!(
+                (norm - 1.0).abs() < 1e-3,
+                "embedding should be L2-normalized, got norm={norm}"
+            );
         }
     }
 }
