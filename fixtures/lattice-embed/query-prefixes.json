@@ -1,0 +1,14 @@
+{
+  "description": "Cross-provider contract fixture (issue #662, PR #663 follow-up). Pins the query-side and passage-side retrieval-instruction prefix each Lattice-backed embedding provider must apply for a given model, so the Rust provider (crates/ruvector-core::embeddings::lattice_native::LatticeEmbedding) and the TS/WASM provider (npm/packages/ruvector-extensions::LatticeWasmEmbeddings) cannot silently re-diverge the way they did before #663. Both providers' contract tests read this same file and fail if either side stops matching it -- a lattice-embed convention bump must update this fixture (and both tests) deliberately, not by accident.",
+  "source_of_truth": "lattice_embed::EmbeddingModel::query_instruction() / document_instruction() -- crates/embed/src/model.rs in ohdearquant/lattice, both documented '**Stable**' in that crate's own API-stability convention.",
+  "models": {
+    "bge-small": {
+      "query_prefix": "Represent this sentence for searching relevant passages: ",
+      "passage_prefix": null
+    },
+    "minilm": {
+      "query_prefix": null,
+      "passage_prefix": null
+    }
+  }
+}
