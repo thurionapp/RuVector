@@ -886,6 +886,10 @@ mod candle_impl {
                     LoadedModelInner::Mistral(model)
                 }
                 ModelArchitecture::Llama => {
+                    // Llama 3.2 1B/3B tie the output projection to the input
+                    // embeddings (no lm_head.weight tensor in the checkpoint);
+                    // detect from tensor presence instead of hardcoding.
+                    let tie_word_embeddings = !vb.contains_tensor("lm_head.weight");
                     let llama_config = llama_model::Config {
                         hidden_size,
                         intermediate_size,
@@ -900,7 +904,7 @@ mod candle_impl {
                         eos_token_id: None,
                         rope_scaling: None,
                         max_position_embeddings: config.max_sequence_length,
-                        tie_word_embeddings: false,
+                        tie_word_embeddings,
                     };
 
                     let model = llama_model::Llama::load(vb, &llama_config).map_err(|e| {
