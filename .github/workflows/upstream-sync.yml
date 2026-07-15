@@ -1,0 +1,126 @@
+name: Upstream Sync (drift check + draft PR)
+
+# Detecta e tenta mesclar automaticamente as novidades de ruvnet/RuVector (upstream real deste
+# fork). trama/crates/trama-runner depende de ruvector-core — o objetivo de manter este fork
+# em dia é permitir redirecionar essa dependência pro fork (thurionapp/RuVector) sem ficar
+# defasado do projeto original.
+#
+# NUNCA empurra direto pra master — abre um PR de rascunho pra revisão humana. Motivo: numa
+# investigação de performance em 2026-07-15 (trama/xybrid), merges grandes de dependências
+# nativas quebraram build silenciosamente (upstream introduziu opções/alvos novos sem que o
+# lado thurionapp soubesse desligar) — então qualquer sync automático fica gated por CI + olho
+# humano, nunca automático até o master.
+
+on:
+  schedule:
+    # Toda segunda 09:00 UTC — cedo o bastante pra dar tempo de revisar durante a semana.
+    - cron: "0 9 * * 1"
+  workflow_dispatch: {}
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    name: Verifica defasagem e propõe merge
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configura git (bot commits)
+        run: |
+          git config user.name "upstream-sync[bot]"
+          git config user.email "upstream-sync@users.noreply.github.com"
+
+      - name: Instala Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Adiciona remote upstream
+        run: |
+          git remote add upstream https://github.com/ruvnet/RuVector.git
+          git fetch upstream main
+
+      - name: Mede a defasagem
+        id: drift
+        run: |
+          BEHIND=$(git rev-list --count HEAD..upstream/main)
+          echo "behind=$BEHIND" >> "$GITHUB_OUTPUT"
+          echo "RuVector está $BEHIND commits atrás de ruvnet/RuVector"
+          if [ "$BEHIND" = "0" ]; then
+            echo "needs_sync=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "needs_sync=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Cria branch de sync
+        if: steps.drift.outputs.needs_sync == 'true'
+        id: branch
+        run: |
+          BRANCH="upstream-sync/$(date +%Y-%m-%d)"
+          git checkout -b "$BRANCH"
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+
+      - name: Mescla ruvnet/RuVector
+        if: steps.drift.outputs.needs_sync == 'true'
+        id: merge
+        continue-on-error: true
+        run: git merge upstream/main --no-edit
+
+      - name: Reporta conflito de merge (precisa de mão humana)
+        if: steps.merge.outcome == 'failure'
+        run: |
+          echo "### ⚠️ Merge de ruvnet/RuVector deu conflito — precisa resolver manualmente" >> "$GITHUB_STEP_SUMMARY"
+          git status --short >> "$GITHUB_STEP_SUMMARY"
+          git merge --abort || true
+
+      - name: Build de validação (workspace inteiro)
+        if: steps.drift.outputs.needs_sync == 'true' && steps.merge.outcome != 'failure'
+        id: build
+        continue-on-error: true
+        run: cargo check --workspace
+
+      - name: Testes (workspace inteiro)
+        if: steps.drift.outputs.needs_sync == 'true' && steps.merge.outcome != 'failure' && steps.build.outcome == 'success'
+        id: test
+        continue-on-error: true
+        run: cargo test --workspace --lib
+
+      - name: Push da branch
+        if: steps.drift.outputs.needs_sync == 'true' && steps.merge.outcome != 'failure'
+        run: git push origin "${{ steps.branch.outputs.branch }}"
+
+      - name: Abre PR de rascunho
+        if: steps.drift.outputs.needs_sync == 'true' && steps.merge.outcome != 'failure'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          STATUS_LINE="✅ build + testes passaram — parece seguro revisar e mesclar"
+          if [ "${{ steps.build.outcome }}" != "success" ]; then
+            STATUS_LINE="❌ build FALHOU — precisa de investigação manual antes de mesclar (ver logs deste run)"
+          elif [ "${{ steps.test.outcome }}" != "success" ]; then
+            STATUS_LINE="⚠️ build passou mas os testes FALHARAM — revisar antes de mesclar"
+          fi
+
+          gh pr create \
+            --title "chore: upstream sync $(date +%Y-%m-%d) — ruvnet/RuVector +${{ steps.drift.outputs.behind }}" \
+            --draft \
+            --body "$(cat <<EOF
+          Sync automático (workflow \`upstream-sync.yml\`) contra o upstream real
+          \`ruvnet/RuVector\`: ${{ steps.drift.outputs.behind }} commits mesclados.
+
+          $STATUS_LINE
+
+          Continua como **rascunho** de propósito — merges grandes em dependências nativas já
+          quebraram build silenciosamente antes em outros repos desta org (ver investigação de
+          performance de 2026-07-15 em thurionapp/xybrid). Revise o diff e os logs de CI antes
+          de tirar do rascunho.
+          EOF
+          )"
